@@ -78,6 +78,10 @@ Runtime: Node ≥ 18 (global `fetch`), CommonJS, **zero dependencies**. Hook com
 | `read_line_cap` | number | 800 | Read guard threshold (lines) |
 | `trim_output_lines` | number | 600 | Bash output trim threshold; `0` disables trimming |
 
+Key handling: the key is entered through the plugin's config prompt (stored in the OS keychain) or set
+as an env var. It is never written to plugin files, logs or `decisions.jsonl`. The doctor shows only the
+last 4 characters. Users must not paste keys into chat, because transcripts are stored on disk.
+
 Env-only (for testing and advanced use): `JEV_BASE_URL` (default `https://api.typesafe.ai`),
 `JEV_TIMEOUT_MS` (default 2500), `CLAUDE_CONFIG_DIR` (default `~/.claude`).
 

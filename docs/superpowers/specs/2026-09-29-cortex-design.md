@@ -1,6 +1,6 @@
 # Cortex — Design Spec
 
-Date: 2026-09-29 · Status: awaiting review · Repo: `claude-token-plugins` → `plugins/cortex`
+Date: 2026-09-29 (rev 2: fully local, no model calls) · Status: approved · Repo: `claude-token-plugins` → `plugins/cortex`
 Build order: after jev-router ships. Delivered in milestones M0–M6 (§15).
 
 ## 1. Goal
@@ -150,7 +150,7 @@ Details…
 | `retrieve/` | Query building, exact + BM25, metadata filters, graph expansion, rerank, excerpting |
 | `budget/` | Token estimation, P0–P4 packing, per-session ledger, caps |
 | `capture/` | Incremental transcript parsing → candidate entries and session checkpoint |
-| `consolidate/` | Dedupe/merge, supersede, conflicts, STATE.md refresh; optional Haiku pass |
+| `consolidate/` | Dedupe/merge, supersede, conflicts, STATE.md refresh (deterministic) |
 
 Diagnostics live in `/cortex:doctor` and `bench/` (§15).
 
@@ -182,6 +182,9 @@ Diagnostics live in `/cortex:doctor` and `bench/` (§15).
    of entries injected in the last 3 turns. This last input resolves "it" and "same approach" lexically.
 2. Exact match on ids, titles and tags.
 3. FTS5 `bm25()`, or the fallback BM25.
+3b. **Semantic stage (optional, local):** when the local embedding engine is available (§9a), cosine
+   similarity between the query and each entry's summary line (vectors cached per entry, re-embedded only when
+   the summary changes) is fused with BM25 through reciprocal-rank fusion. Without the engine this stage is skipped.
 4. Metadata filter: current project + global; `superseded` and `historical` excluded unless the prompt asks
    about history.
 5. Graph expansion over `related` and backlinks: depth 1 by default (max 2), neighbours at 0.5× score.
@@ -198,10 +201,16 @@ Diagnostics live in `/cortex:doctor` and `bench/` (§15).
 ```
 If two retrieved entries conflict, one line is added: `Conflicting memories above; ask the user if it matters.`
 
-**Optional JEV gating:** if `JEV_API_KEY` is set, a `noul` question ("Does this request refer to earlier
-work or context not stated in it?") skips retrieval for self-contained prompts. A `choice` question reranks
-the top 8. Without JEV, a heuristic gate is used (pronouns and "again / same / previous / continue" cues,
-or known entity names).
+### 9a. Local engine (optional, fully on-device)
+Cortex reuses jev-router's local embedding engine (all-MiniLM-L6-v2 on onnxruntime-node) when it is
+installed. The engine is found through jev-router's `engine/READY.json` in its plugin data dir. Cortex never
+downloads anything itself. With the engine:
+- a `noul` question ("Does this request refer to earlier work or context not stated in it?") skips retrieval
+  for self-contained prompts,
+- the semantic stage (3b) is enabled.
+
+Without it, a heuristic gate is used: pronouns, "again / same / previous / continue" cues, or known entity
+names. **No hosted model is ever called.**
 
 ## 10. Token budget
 
@@ -232,10 +241,8 @@ It parses new transcript lines since the saved offset.
 | Files edited, commits made, tests run, final assistant summary | Session checkpoint (`sessions/…`) |
 | Explicit `/cortex:remember` | Entry with status `current`, confidence 1.0 |
 
-**Optional Haiku consolidation** (`llm_consolidation: false` by default): after `SessionEnd` or `PreCompact`,
-a detached job runs `claude -p --model haiku` over the session checkpoint to extract facts, decisions and
-failed approaches as schema-valid entries. It has a daily token cap (default 20k), and its results are
-validated by the same schema as manual entries.
+Capture is deterministic only: no model calls. Richer summaries come from `/cortex:remember`, which the
+user or Claude can call in-session.
 
 ## 12. Consolidation (incremental, idempotent)
 
@@ -258,7 +265,9 @@ It runs on the `Stop` capture (cheap rules) and in the detached job (full pass):
   content captured.
 - **`/cortex:forget <query|id>`**: removes the entry file, its backups and index rows, and adds its id and
   a content fingerprint to `tombstones.jsonl`. Capture checks tombstones, so forgotten facts cannot come back.
-- **Everything local.** Network is used only if the optional JEV key or Haiku consolidation is enabled.
+- **Everything local. Cortex makes no network calls at all**, which a test enforces by making `fetch` and
+  `http(s).request` throw. Claude Code itself still sends the conversation, including injected memory
+  excerpts, to Anthropic as usual.
 
 ## 14. Commands
 
@@ -277,7 +286,7 @@ Whether an unprefixed `/cortex status` form works is verified in M0. If it doesn
 | M2 | `index/` + `retrieve/` + **CORTEX.md generation and fallback retrieval** | Topic discovery (4), offline use (13), large store (14: 5k synthetic entries, p95 latency), CORTEX.md cap/diff/fallback |
 | M3 | `budget/` + SessionStart/UserPromptSubmit injection + ledger | New-session retrieval (1), reference resolution (3), budget enforcement (10) |
 | M4 | `capture/` + Stop async + PreCompact + SessionEnd | Cross-session continuity (2), crash with no SessionEnd |
-| M5 | `consolidate/` + optional Haiku job | Duplicates (8), conflicting updates (9), idempotence |
+| M5 | `consolidate/` (deterministic) + optional semantic stage via local engine | Duplicates (8), conflicting updates (9), idempotence |
 | M6 | Commands, doctor, docs, `bench/` | Golden-query evaluation in CI (recall@5, tokens, latency); opt-in A/B benchmark with `claude -p --output-format json` over scripted multi-session scenarios. **Numbers are reported only from real runs** |
 
 Docs: README (install, config, storage, backup/restore, troubleshooting, limitations), ARCHITECTURE,
@@ -290,9 +299,9 @@ MEMORY_SCHEMA (including CORTEX.md), SECURITY, BENCHMARKS.
 | `storage_dir` (directory) | `~/.cortex` |
 | `session_start_budget` / `prompt_budget` / `session_cap` | 500 / 350 / 4000 |
 | `graph_depth` | 1 |
-| `llm_consolidation` (boolean) / `llm_daily_tokens` | false / 20000 |
 | `mode` | `auto` \| `capture-only` \| `off` |
 
 ## 17. Non-goals (v1)
 
-Embeddings (revisit only if the M6 benchmark shows a recall gap), cloud sync, a UI, and writing into native memory.
+Hosted models of any kind, a bundled embedding model of Cortex's own (it reuses jev-router's local engine),
+cloud sync, a UI, and writing into native memory.

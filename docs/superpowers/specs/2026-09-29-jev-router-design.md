@@ -67,12 +67,13 @@ claude-token-plugins/
     │   ├── catalog.js  shortlist.js  heuristics.js  policy.js  guard-rules.js
     │   └── engine/
     │       ├── index.js       # decide(): engine → Decision; loopback-only remote option
-    │       ├── local.js       # ONNX session, mean pooling, normalise, typed questions
+    │       ├── local.js       # ONNX session, mean pooling, normalise
+    │       ├── questions.js   # typed questions: choice / score / noul
     │       ├── wordpiece.js   # zero-dep BERT WordPiece tokenizer (reads tokenizer.json)
-    │       ├── vectors.js     # label-vector cache
+    │       ├── vectors.js     # label-vector cache (vectors.json, base64 Float32)
     │       └── manifest.js    # pinned model revision + sha256, engine paths
     ├── agents/quick.md  agents/scout.md
-    ├── commands/setup.md  commands/doctor.md
+    ├── skills/setup/SKILL.md  skills/doctor/SKILL.md   # skills supersede commands/ in current Claude Code
     └── test/ (node:test) + test/fixtures/
 ```
 
@@ -124,8 +125,11 @@ Everything runs on normalised mean-pooled embeddings with cosine similarity. `T`
 - `score(state, levels[])`: each level has a prototype text plus 2–3 fixed exemplar phrases; its similarity is
   the max over them; softmax with T = 0.05 → `{score: Σ i·pᵢ, probabilities, confidence: max pᵢ}`.
 - `noul(state, {true, false})`: softmax over the two descriptions with T = 0.05 → `{noul: p(true)}`.
-- Label vectors are cached in `${CLAUDE_PLUGIN_DATA}/vectors.bin` together with a JSON index, keyed by
-  sha1 of the label text, so agents are embedded only once.
+- Label vectors are cached in `${CLAUDE_PLUGIN_DATA}/vectors.json` (base64 Float32, keyed by sha1 of the
+  label text, atomic rename on save, capped at 3,000 entries), so agents are embedded only once. Setup
+  pre-computes vectors for the whole catalog.
+- Candidate pool = the top 12 agents by cosine similarity plus the BM25 shortlist, so agents with no
+  lexical overlap can still be chosen.
 - Inputs are truncated to 256 WordPiece tokens. ONNX session options: 1 intra-op thread and graph
   optimisation enabled.
 

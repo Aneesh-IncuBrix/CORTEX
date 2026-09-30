@@ -220,7 +220,32 @@ The final difficulty combines the engine distribution (weight 0.6) with the heur
 - **CI**: GitHub Actions on `ubuntu-latest` and `windows-latest`, running unit tests, setup + engine
   integration, and `claude plugin validate`.
 
-## 12. Non-goals
+## 12. User-trouble hardening (rev 3, 2026-09-30)
+
+The implementation plan carries a 21-row user-trouble register (U1–U21), with a fix and a test or check for each row. Design-level additions:
+
+- **Readiness states**: `missing | stale | broken | lite | ready`. Each state has its own SessionStart message, shown at most once per 24 h per state.
+- **Lite mode**: when the native engine can't run (unsupported OS/arch, musl, Smart App Control/AV block, or `--lite`), routing uses the built-in rules. The guard is unaffected.
+- **Setup**:
+  - preflight (Node 18+, npm, write access, ~300 MB free) and an exclusive lock;
+  - `HF_ENDPOINT` mirrors and `--model-dir` offline import, both checksum-enforced;
+  - proxy guidance in the download error.
+- **Guard**:
+  - circuit breaker after 5 denials per session;
+  - `find` with `-delete`/`-exec` isn't treated as a listing;
+  - deny reasons tell Claude to repeat the call if the user asked for full output;
+  - `agent_type` is logged for subagent calls.
+- **Hints** are tool-neutral (`delegate to subagent "<name>"`).
+- **Engine**:
+  - the model loads from bytes (non-ASCII paths);
+  - at most 40 new agent embeddings per prompt, with the cache saved every 20.
+- **Releases**:
+  - every change to shipped plugin files bumps `plugin.json` `version`, enforced in CI, because users only receive updates when it changes;
+  - weekly scheduled CI on Linux, Windows and macOS.
+- **Latency budget**: route hook p95 ≤ 1200 ms and guard hook p95 ≤ 200 ms, measured by `scripts/bench-hooks.js`.
+- **Live-verified behaviours** (Task 3b), recorded in §3: coexistence with other plugins' hooks, hooks inside subagents, Edit after a partial Read, a missing Node, and plugin paths with spaces.
+
+## 13. Non-goals
 
 The TypeSafe hosted API, model switching, a request proxy, an MCP decide tool, and savings dashboards.
 Cortex is specified separately.

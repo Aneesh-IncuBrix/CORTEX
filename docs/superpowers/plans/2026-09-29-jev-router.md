@@ -24,6 +24,39 @@
 - User-invocable entry points are **skills** (`skills/<name>/SKILL.md` → `/jev-router:<name>`); `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` are substituted in skill content.
 - Commit after every task, with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Files use LF line endings (`.gitattributes`).
+- **User-facing messages** (hint, reminder, setup, doctor, deny reasons) say what happened plus **one next step**. Never a stack trace; stacks go to `errors.log`.
+- **Every release that changes shipped plugin files bumps `version` in `plugin.json`** and adds a `CHANGELOG.md` entry. Users only receive updates when the version string changes; CI enforces this (Task 12).
+- Hooks do nothing on Node < 18 (silent exit 0); setup and doctor print the reason.
+
+## User-trouble register (pre-release hardening)
+
+Each row names where the fix lives. Rows marked **live** are verified against a real Claude Code session in Task 3b.
+
+| # | Trouble a user could hit | Who / when | Fix | Task |
+|---|---|---|---|---|
+| U1 | Node missing from PATH → "hook error" notice on every event | Native-installer users without Node | Document the prerequisite; Task 3b records the exact notice text for the README troubleshooting section | 3b, 13 |
+| U2 | Node < 18 → crashes on `fetch` and other APIs | Old LTS machines | `runHook` exits 0 silently; setup and doctor explain | 2, 9, 11 |
+| U3 | Guard frustrates: user wanted the whole file; loops of denials | Everyone | Deny reason says "if the user asked for it, re-issue"; **circuit breaker** after 5 denials per session; `find … -delete/-exec` is not a listing | 2, 3 |
+| U4 | Partial Read (offset/limit) might not satisfy Edit's "read first" rule | Editing files > 800 lines | **live** check; if Edit refuses, raise the cap to 2000 and change the wording | 3b |
+| U5 | Our deny collides with other plugins' PreToolUse hooks (parallel, undocumented merge) | Users with GateGuard, ECC etc. | **live** coexistence check; the guard never returns `allow` | 3, 3b |
+| U6 | Guard fires inside subagents | Everyone | Expected (docs); log `agent_type`; the helper agents are told to use offset/limit | 3, 3b |
+| U7 | Hint names a tool that doesn't exist (`Task` was renamed `Agent`) | Everyone | Tool-neutral wording: `delegate to subagent "<name>"` | 6 |
+| U8 | Unsupported platform (Intel Mac, Alpine/musl, old glibc) or Smart App Control/AV blocks the engine | Some Mac/Linux/Windows users | Preflight platform check; if the engine can't load, **lite mode** (routing on built-in rules) | 9, 10 |
+| U9 | Corporate proxy / Hugging Face blocked (e.g. some regions) / air-gapped | Enterprise users | `HF_ENDPOINT` mirror (still checksum-verified), `--model-dir` offline import, proxy guidance in the error | 7, 9 |
+| U10 | Two sessions run setup at once; not enough disk; read-only data dir | Everyone | Setup lock, disk and write preflight | 9 |
+| U11 | Non-ASCII Windows user folder breaks the native model path | e.g. `C:\Users\José` | Load the model from bytes, not a path | 8 |
+| U12 | Plugin update changes the engine version → routing silently stops | After updates | Readiness states: `missing / stale / broken / lite / ready`, each with its own message | 7, 10 |
+| U13 | Setup reminder spams headless or cloud sessions | `-p` scripts, ephemeral envs | Reminder at most once per 24 h per state | 10 |
+| U14 | First prompt after adding many agents times out and never warms the cache | Users with 300+ agents | At most 40 new embeddings per prompt, cache saved every 20 | 8 |
+| U15 | Hook lag on every prompt | Slow disks, AV scanning | Latency budget measured: route p95 ≤ 1200 ms, guard p95 ≤ 200 ms | 13 |
+| U16 | Users never receive fixes (pinned version, auto-update off) | Everyone | Version-bump CI check; README shows how to enable auto-update or update manually | 12, 13 |
+| U17 | Setup blocked by auto-mode classifier or Bash permission | Auto-mode users | Doctor prints the exact command to run in their own terminal | 11 |
+| U18 | Uninstall leaves 100 MB behind | Everyone | Default uninstall deletes the data dir (docs); `--uninstall` in setup; documented | 13 |
+| U19 | Trim conflicts with another plugin that rewrites Bash output | Users with output-rewriting plugins | Trim off by default; doctor warns about other PostToolUse Bash hooks | 4, 11 |
+| U20 | Licence and attribution for the bundled model and runtime | Redistributors | `THIRD_PARTY_NOTICES.md` | 13 |
+| U21 | Windows PowerShell tool isn't guarded (only Bash) | Windows users | Documented limitation (v0.2 candidate) | 13 |
+
+**Execution order:** 1 → 2 → 3 → 3b → 4 → 5 → 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13.
 
 ## Review Focus
 
@@ -329,7 +362,7 @@ git add -A && git commit -m "feat(jev-router): scaffold marketplace, plugin mani
 - Test: `plugins/jev-router/test/hookio.test.js`, `test/log-ledger.test.js`
 
 **Interfaces:**
-- Produces: `runHook(name, budgetMs, main(input) → out|null, dataDir)`; `logError(dataDir, name, err)`; `parseInput(raw) → object`; `appendCapped(file, record, max=500, trimAt=600)`; `readTail(file, n) → object[]`; `fingerprint(text) → {len, sha}`; `keyFor(toolName, toolInput) → hex`; `canonical(value) → string`; `seenBefore(dataDir, sessionId, key, now?) → boolean`.
+- Produces: `runHook(name, budgetMs, main(input) → out|null, dataDir)`; `nodeSupported(version?) → boolean`; `logError(dataDir, name, err)`; `parseInput(raw) → object`; `appendCapped(file, record, max=500, trimAt=600)`; `readTail(file, n) → object[]`; `fingerprint(text) → {len, sha}`; `keyFor(toolName, toolInput) → hex`; `canonical(value) → string`; `seenBefore(dataDir, sessionId, key, now?) → boolean`; `deniesSoFar(dataDir, sessionId) → number`; `bumpDenies(dataDir, sessionId) → number`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -342,7 +375,7 @@ const fs = require('fs');
 const path = require('path');
 const { tmpDir } = require('./helpers');
 const { appendCapped, readTail, fingerprint } = require('../lib/log');
-const { keyFor, seenBefore, canonical } = require('../lib/ledger');
+const { keyFor, seenBefore, canonical, deniesSoFar, bumpDenies } = require('../lib/ledger');
 
 test('appendCapped trims to newest 500 once over 600', () => {
   const f = path.join(tmpDir(), 'd.jsonl');
@@ -393,6 +426,15 @@ test('seenBefore prunes ledger files older than 48h', () => {
   seenBefore(dir, 'new', 'k2');
   assert.equal(fs.existsSync(old), false);
 });
+
+test('deny counter is per session and starts at zero (circuit breaker, U3)', () => {
+  const dir = tmpDir();
+  assert.equal(deniesSoFar(dir, 's1'), 0);
+  assert.equal(bumpDenies(dir, 's1'), 1);
+  assert.equal(bumpDenies(dir, 's1'), 2);
+  assert.equal(deniesSoFar(dir, 's1'), 2);
+  assert.equal(deniesSoFar(dir, 's2'), 0);
+});
 ```
 
 `plugins/jev-router/test/hookio.test.js`
@@ -403,7 +445,13 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { tmpDir, write, runScript } = require('./helpers');
-const { parseInput } = require('../lib/hookio');
+const { parseInput, nodeSupported } = require('../lib/hookio');
+
+test('nodeSupported requires Node 18+ (U2)', () => {
+  assert.equal(nodeSupported('16.20.2'), false);
+  assert.equal(nodeSupported('18.0.0'), true);
+  assert.equal(nodeSupported('25.5.0'), true);
+});
 
 const HOOKIO = JSON.stringify(path.join(__dirname, '..', 'lib', 'hookio.js'));
 
@@ -497,8 +545,13 @@ function finish(out) {
   else process.exit(0);
 }
 
+function nodeSupported(version = process.versions.node) {
+  return Number(String(version).split('.')[0]) >= 18;
+}
+
 // Fail-open hook runner: whatever happens, exit 0 within budgetMs.
 function runHook(name, budgetMs, main, dataDir) {
+  if (!nodeSupported()) process.exit(0); // U2: never crash old Node; doctor explains
   const timer = setTimeout(() => process.exit(0), budgetMs);
   readStdin().then(async raw => {
     let out = null;
@@ -512,7 +565,7 @@ function runHook(name, budgetMs, main, dataDir) {
   });
 }
 
-module.exports = { runHook, logError, parseInput, readStdin };
+module.exports = { runHook, nodeSupported, logError, parseInput, readStdin };
 ```
 
 `plugins/jev-router/lib/log.js`
@@ -594,7 +647,23 @@ function seenBefore(dataDir, sessionId, key, now = Date.now()) {
   return false;
 }
 
-module.exports = { keyFor, canonical, seenBefore, safeSession };
+// Circuit breaker counter (U3): how many denials this session has seen.
+function denyFile(dataDir, sessionId) {
+  return path.join(dataDir, 'ledger', `${safeSession(sessionId)}.denies`);
+}
+
+function deniesSoFar(dataDir, sessionId) {
+  try { return Number(fs.readFileSync(denyFile(dataDir, sessionId), 'utf8')) || 0; } catch { return 0; }
+}
+
+function bumpDenies(dataDir, sessionId) {
+  const n = deniesSoFar(dataDir, sessionId) + 1;
+  fs.mkdirSync(path.join(dataDir, 'ledger'), { recursive: true });
+  fs.writeFileSync(denyFile(dataDir, sessionId), String(n));
+  return n;
+}
+
+module.exports = { keyFor, canonical, seenBefore, safeSession, deniesSoFar, bumpDenies };
 ```
 
 - [ ] **Step 4: Run tests** → `npm test` → Expected: all passing.
@@ -632,7 +701,7 @@ const ctx = { readLineCap: 800, cwd: dir };
 test('Read: denies full read of a big file, with size and token estimate', () => {
   const r = evaluate('Read', { file_path: big }, ctx);
   assert.match(r.deny, /big\.log has 1001 lines \(~1,250 tokens\)/);
-  assert.match(r.deny, /Re-issue the identical call to proceed anyway\.$/);
+  assert.match(r.deny, /or the user asked for it\), re-issue the identical call to proceed\.$/);
 });
 
 test('Read: relative path resolves against cwd', () => {
@@ -689,6 +758,8 @@ const allowed = [
   'git status',
   'find . -maxdepth 2 -name "*.js"',
   'find . -name "*.js" | head',
+  'find . -name "*.tmp" -delete',
+  'find . -name "*.js" -exec wc -l {} +',
   'ls -la',
   'docker logs --tail 200 api',
   'journalctl -n 100',
@@ -714,7 +785,8 @@ test('Bash: background commands and unknown tools are ignored', () => {
 const fs = require('fs');
 const path = require('path');
 
-const SUFFIX = ' Re-issue the identical call to proceed anyway.';
+const SUFFIX = ' If you need all of it (or the user asked for it), re-issue the identical call to proceed.';
+const FIND_OK = ['-maxdepth', '-quit', '-delete', '-exec', '-execdir', '-ok', '-okdir'];
 const SKIP_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.pdf', '.ipynb']);
 const SCAN_LIMIT = 8 * 1024 * 1024;
 const BOUNDING = /^(head|tail|grep|egrep|fgrep|rg|wc|less|more|sort|uniq|awk|sed|jq|cut|tee|xargs)$/;
@@ -817,7 +889,7 @@ function checkStage(w, stageText, ctx) {
       return 'git log without a limit can print thousands of lines. Add -n 20 (or --oneline -n 50).';
     }
   }
-  if (cmd === 'find' && !args.includes('-maxdepth') && !args.includes('-quit')) return 'find without -maxdepth can walk huge trees. Add -maxdepth N, or pipe to head.';
+  if (cmd === 'find' && !args.some(a => FIND_OK.includes(a))) return 'find without -maxdepth can list huge trees. Add -maxdepth N, or pipe to head.';
   if (cmd === 'ls' && args.some(a => a === '--recursive' || /^-[a-zA-Z]*R/.test(a))) return 'ls -R lists every nested file. Use Glob or find -maxdepth instead.';
   if (cmd === 'docker' && args[0] === 'logs' && !args.some(a => /^(--tail|-n)(=|$)/.test(a))) return 'docker logs without --tail prints the whole log. Add --tail 200.';
   if (cmd === 'journalctl' && !args.some(a => /^(-n|--lines)(=|$)|^-n\d+$/.test(a))) return 'journalctl without -n prints the whole journal. Add -n 200.';
@@ -895,6 +967,25 @@ test('garbage stdin exits 0 silently', async () => {
   assert.equal(r.code, 0);
   assert.equal(r.stdout, '');
 });
+
+test('circuit breaker: after 5 denials in a session the guard stands down (U3)', async () => {
+  const h = hookEnv();
+  const files = [1, 2, 3, 4, 5, 6].map(i => write(path.join(h.data, `big${i}.txt`), 'x\n'.repeat(2000)));
+  const outs = [];
+  for (const f of files) outs.push(await runScript(script, { session_id: 'b1', tool_name: 'Read', tool_input: { file_path: f }, cwd: h.data }, h.env));
+  assert.equal(outs.slice(0, 5).filter(o => o.json && o.json.hookSpecificOutput.permissionDecision === 'deny').length, 5);
+  assert.equal(outs[5].stdout, '');
+  assert.match(fs.readFileSync(path.join(h.data, 'guard.jsonl'), 'utf8'), /"action":"breaker-open"/);
+  const fresh = await runScript(script, { session_id: 'b2', tool_name: 'Read', tool_input: { file_path: files[5] }, cwd: h.data }, h.env);
+  assert.equal(fresh.json.hookSpecificOutput.permissionDecision, 'deny');
+});
+
+test('guard log records the subagent type when a subagent made the call (U6)', async () => {
+  const h = hookEnv();
+  const big = write(path.join(h.data, 'big.txt'), 'x\n'.repeat(2000));
+  await runScript(script, { session_id: 's', agent_id: 'a1', agent_type: 'Explore', tool_name: 'Read', tool_input: { file_path: big }, cwd: h.data }, h.env);
+  assert.match(fs.readFileSync(path.join(h.data, 'guard.jsonl'), 'utf8'), /"agent":"Explore"/);
+});
 ```
 
 - [ ] **Step 6: Implement the hook and wiring**
@@ -907,18 +998,27 @@ const path = require('path');
 const { loadConfig } = require('../lib/config');
 const { runHook } = require('../lib/hookio');
 const { evaluate } = require('../lib/guard-rules');
-const { keyFor, seenBefore } = require('../lib/ledger');
+const { keyFor, seenBefore, deniesSoFar, bumpDenies } = require('../lib/ledger');
 const { appendCapped } = require('../lib/log');
 
 const cfg = loadConfig();
+const MAX_DENIES_PER_SESSION = 5; // U3: never trap a session in a loop of denials
 
 runHook('guard-tool', 4000, async (input) => {
   if (cfg.mode === 'off') return null;
   const rule = evaluate(input.tool_name, input.tool_input || {}, { readLineCap: cfg.readLineCap, cwd: input.cwd });
   if (!rule) return null;
+  const log = action => appendCapped(path.join(cfg.dataDir, 'guard.jsonl'), {
+    ts: new Date().toISOString(),
+    tool: input.tool_name,
+    agent: input.agent_type || null,
+    action,
+  });
+  if (deniesSoFar(cfg.dataDir, input.session_id) >= MAX_DENIES_PER_SESSION) { log('breaker-open'); return null; }
   const repeat = seenBefore(cfg.dataDir, input.session_id, keyFor(input.tool_name, input.tool_input));
-  appendCapped(path.join(cfg.dataDir, 'guard.jsonl'), { ts: new Date().toISOString(), tool: input.tool_name, action: repeat ? 'allowed-repeat' : 'deny' });
+  log(repeat ? 'allowed-repeat' : 'deny');
   if (repeat) return null;
+  bumpDenies(cfg.dataDir, input.session_id);
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -947,6 +1047,80 @@ runHook('guard-tool', 4000, async (input) => {
 
 - [ ] **Step 7: Run tests** → `npm test` → all passing. Then run `claude plugin validate plugins/jev-router` → no errors.
 - [ ] **Step 8: Commit** → `git add -A && git commit -m "feat(jev-router): deny-once tool guard for Read, Bash and Grep" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
+
+---
+
+### Task 3b: Live platform checks (real Claude Code, before building further)
+
+Five cheap headless runs (haiku model, a few cents in total) that settle the questions the docs leave open. Record each result in spec §3 under a new **"Verified behaviours (2026-09-30)"** table: check, observed result, decision. Every check has a decision rule, so no result leaves the plan ambiguous.
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-09-29-jev-router-design.md` (§3 results table); code changes only where a decision rule below requires them.
+
+- [ ] **Step 1: Fixtures** (bash, repo root)
+
+```bash
+TMPD="$(node -p "require('os').tmpdir()")"
+node -e "require('fs').writeFileSync(process.argv[1]+'/jr-big.txt','line\n'.repeat(2000))" "$TMPD"
+node -e "require('fs').writeFileSync(process.argv[1]+'/jr-edit.txt',Array.from({length:1000},(_,i)=>'row '+(i+1)).join('\n'))" "$TMPD"
+D="$HOME/.claude/plugins/data/jev-router-inline"; rm -rf "$D"
+```
+
+- [ ] **Step 2: Coexistence with the user's other plugins and hooks (U5)**
+
+Run with the user's normal config, so GateGuard/ECC and other PreToolUse hooks are active, plus this plugin:
+```bash
+claude --plugin-dir plugins/jev-router --model haiku --allowedTools Read -p "Use the Read tool on $TMPD/jr-big.txt with no offset or limit. Then report in one line exactly what the tool returned." --output-format stream-json --verbose > "$TMPD/jr-3b-2.jsonl"
+grep -o '\[jev-router\][^"]*' "$TMPD/jr-3b-2.jsonl" | head -2; cat "$D/guard.jsonl"
+```
+Expected: our reason reaches Claude and `guard.jsonl` shows `deny`. Record which other hooks fired.
+**Decision:** if another plugin's decision suppresses ours, keep the behaviour (never `allow`, fail-open) and document the interaction under README "Known limitations".
+
+- [ ] **Step 3: Subagents (U6)**
+
+```bash
+claude --plugin-dir plugins/jev-router --model haiku --allowedTools "Read,Agent,Task" -p "Use the Explore subagent to read $TMPD/jr-big.txt in full with one Read call and report its first line." --output-format stream-json --verbose > "$TMPD/jr-3b-3.jsonl"
+grep '"agent":' "$D/guard.jsonl" | tail -3
+```
+Expected: an entry with `"agent":"Explore"`, which confirms that tool hooks fire inside subagents and carry `agent_type`.
+**Decision:** if `agent` is always `null`, keep the code (it is harmless) and note that `agent_type` is absent on this CLI version.
+
+- [ ] **Step 4: Does a partial Read satisfy Edit? (U4)**
+
+```bash
+claude --plugin-dir plugins/jev-router --model haiku --allowedTools "Read,Edit" -p "Read $TMPD/jr-edit.txt with offset 1 and limit 20 only. Then use the Edit tool to replace the exact text 'row 900' with 'ROW 900'. Do not read the file again." --output-format stream-json --verbose > "$TMPD/jr-3b-4.jsonl"
+grep -c "ROW 900" "$TMPD/jr-edit.txt"
+```
+Expected: `1`, meaning partial reads satisfy Edit and the guard stays as designed.
+**Decision if `0` and the stream shows Edit demanding a full read:**
+- raise the `read_line_cap` default to 2000 (in plugin.json, `loadConfig`, and the config test);
+- in `checkRead`, prefix the reason with `If you are about to edit this file, re-issue this Read. Otherwise: `;
+- add a unit test asserting that prefix;
+- re-run `npm test`.
+
+- [ ] **Step 5: Node missing from PATH (U1) and a plugin path with spaces**
+
+```bash
+T="$TMPD/jev router copy"; rm -rf "$T"; mkdir -p "$T"; cp -r plugins/jev-router/. "$T"
+sed -i 's/"node /"node-missing-xyz /' "$T/hooks/hooks.json"
+claude --plugin-dir "$T" --model haiku -p "reply with the single word ok" --output-format stream-json --verbose > "$TMPD/jr-3b-5a.jsonl"; echo "exit=$?"
+grep -io 'hook error[^"]*' "$TMPD/jr-3b-5a.jsonl" | head -2
+rm -rf "$T"; mkdir -p "$T"; cp -r plugins/jev-router/. "$T"
+claude --plugin-dir "$T" --model haiku --allowedTools Read -p "Use the Read tool on $TMPD/jr-big.txt with no offset or limit and report what it returned in one line." --output-format stream-json --verbose > "$TMPD/jr-3b-5b.jsonl"
+grep -c '\[jev-router\]' "$TMPD/jr-3b-5b.jsonl"; rm -rf "$T"
+```
+Expected:
+- **5a:** `exit=0` and the reply `ok`, which shows a missing Node is non-blocking. Copy the exact notice text into the README troubleshooting entry "Node.js not found" (Task 13).
+- **5b:** count ≥ 1, which shows quoting works when the plugin path contains spaces.
+
+**Decision if 5b fails:** switch every hook in `hooks.json` to exec form (`"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/<x>.js"]`), re-validate, and re-run 5b.
+
+- [ ] **Step 6: Clean up and commit**
+
+```bash
+rm -f "$TMPD"/jr-big.txt "$TMPD"/jr-edit.txt "$TMPD"/jr-3b-*.jsonl; rm -rf "$D"
+git add -A && git commit -m "docs(jev-router): record live platform checks (coexistence, subagents, Edit, missing node)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
 
 ---
 
@@ -1115,7 +1289,7 @@ Add to `hooks/hooks.json` under `"hooks"`:
 - Test: `plugins/jev-router/test/catalog.test.js`
 
 **Interfaces:**
-- Produces: `loadCatalog({configDir, projectDir, dataDir?, pluginRoot?}) → {signature, agents: Agent[], counts: {builtin, user, project, plugin}, duplicates: string[]}` with `Agent = {name, description, model, source}`; `parseFrontmatter(text) → {data, body}`; `cleanDescription(s, max=240) → string`; `BUILTINS`.
+- Produces: `loadCatalog({configDir, projectDir, dataDir?, pluginRoot?}) → {signature, agents: Agent[], counts: {builtin, user, project, plugin}, duplicates: string[]}` with `Agent = {name, description, model, source}`; `enabledPluginInstalls(configDir, projectDir) → {id, plugin, installPath, manifest}[]`; `parseFrontmatter(text) → {data, body}`; `cleanDescription(s, max=240) → string`; `BUILTINS`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1355,7 +1529,8 @@ function pickInstall(entries, projectDir) {
     || null;
 }
 
-function pluginSources(configDir, projectDir) {
+// Current install of every enabled plugin: [{id, plugin, installPath, manifest}]. Also used by doctor (U19).
+function enabledPluginInstalls(configDir, projectDir) {
   const installed = readJson(path.join(configDir, 'plugins', 'installed_plugins.json'));
   const table = (installed && installed.plugins) || {};
   const out = [];
@@ -1363,12 +1538,17 @@ function pluginSources(configDir, projectDir) {
     const entry = pickInstall(table[id], projectDir);
     if (!entry || !entry.installPath) continue;
     const manifest = readJson(path.join(entry.installPath, '.claude-plugin', 'plugin.json')) || {};
-    const plugin = manifest.name || id.split('@')[0];
-    const declared = manifest.agents ? [].concat(manifest.agents) : null;
-    const targets = declared ? declared.map(p => path.resolve(entry.installPath, p)) : [path.join(entry.installPath, 'agents')];
-    out.push({ plugin, targets, source: 'plugin' });
+    out.push({ id, plugin: manifest.name || id.split('@')[0], installPath: entry.installPath, manifest });
   }
   return out;
+}
+
+function pluginSources(configDir, projectDir) {
+  return enabledPluginInstalls(configDir, projectDir).map(({ plugin, installPath, manifest }) => {
+    const declared = manifest.agents ? [].concat(manifest.agents) : null;
+    const targets = declared ? declared.map(p => path.resolve(installPath, p)) : [path.join(installPath, 'agents')];
+    return { plugin, targets, source: 'plugin' };
+  });
 }
 
 function agentFromFile(f) {
@@ -1430,7 +1610,7 @@ function loadCatalog({ configDir, projectDir, dataDir, pluginRoot }) {
   return result;
 }
 
-module.exports = { loadCatalog, parseFrontmatter, cleanDescription, BUILTINS };
+module.exports = { loadCatalog, parseFrontmatter, cleanDescription, enabledPluginInstalls, BUILTINS };
 ```
 
 - [ ] **Step 4: Run tests** → `npm test` → all passing.
@@ -1506,8 +1686,8 @@ const byName = new Map(agents.map(a => [a.name, a]));
 const base = { source: 'engine', difficulty: 1, difficultyConf: 0.7, agent: null, agentConf: 0, verbose: false, latencyMs: 5 };
 const cases = [
   ['null decision', null, null],
-  ['confident agent with model', { ...base, agent: 'Explore', agentConf: 0.8 }, /delegate: Task\(subagent_type="Explore"\) \[haiku\] · answer tersely$/],
-  ['inherit model has no bracket', { ...base, difficulty: 2, agent: 'doc-updater', agentConf: 0.9 }, /subagent_type="doc-updater"\)$/],
+  ['confident agent with model', { ...base, agent: 'Explore', agentConf: 0.8 }, /delegate to subagent "Explore" \[haiku\] · answer tersely$/],
+  ['inherit model has no bracket', { ...base, difficulty: 2, agent: 'doc-updater', agentConf: 0.9 }, /delegate to subagent "doc-updater"$/],
   ['low agent conf, simple → scout + terse', { ...base, agent: 'Explore', agentConf: 0.5 }, /scout \[haiku\] · answer tersely$/],
   ['simple but verbose → scout only', { ...base, verbose: true }, /scout \[haiku\]$/],
   ['moderate, no agent → silent', { ...base, difficulty: 2 }, null],
@@ -1653,7 +1833,7 @@ function toHint(d, { agentsByName }) {
   if (d.agent && d.agentConf >= 0.55) {
     const a = agentsByName && agentsByName.get(d.agent);
     const model = a && a.model && a.model !== 'inherit' ? ` [${a.model}]` : '';
-    parts.push(`delegate: Task(subagent_type="${d.agent}")${model}`);
+    parts.push(`delegate to subagent "${d.agent}"${model}`); // tool-neutral: the tool was renamed Task → Agent (U7)
   } else if (d.difficulty <= 1 && confidentLevel) {
     parts.push('delegate file search/reading to jev-router:scout [haiku]');
   }
@@ -1678,7 +1858,7 @@ module.exports = { toHint, LEVELS };
 - Test: `plugins/jev-router/test/engine-primitives.test.js`, `test/fake-embedder.js`
 
 **Interfaces:**
-- Produces: `MODEL`, `ENGINE_VERSION`, `enginePaths(dataDir) → {root, modelDir, model, tokenizer, ready, ortModule}`, `fileUrl(file)`, `sha256File(path)`, `readReady(dataDir) → object|null`; `new WordPiece(tokenizerJson).encode(text, maxLen=256) → number[]`; `new VectorCache(file, max=3000)` with `get(text)`, `set(text, Float32Array)`, `save()`; `dot, softmax, argmax`, `choice(vec, stateVec, criteria)`, `score(vec, stateVec, levels)`, `noul(vec, stateVec, {true,false})`, where `vec: async (text) → Float32Array`.
+- Produces: `MODEL`, `ENGINE_VERSION`, `enginePaths(dataDir) → {root, modelDir, model, tokenizer, ready, ortModule}`, `fileUrl(file, endpoint?)`, `sha256File(path)`, `readinessState(dataDir) → {state: 'missing'|'stale'|'broken'|'lite'|'ready', ready}`, `readReady(dataDir) → object|null`; `new WordPiece(tokenizerJson).encode(text, maxLen=256) → number[]`; `new VectorCache(file, max=3000)` with `get(text)`, `set(text, Float32Array)`, `save()`; `dot, softmax, argmax`, `choice(vec, stateVec, criteria)`, `score(vec, stateVec, levels)`, `noul(vec, stateVec, {true,false})`, where `vec: async (text) → Float32Array`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1713,7 +1893,7 @@ const { fakeEmbed } = require('./fake-embedder');
 const { WordPiece } = require('../lib/engine/wordpiece');
 const { VectorCache } = require('../lib/engine/vectors');
 const { softmax, choice, score, noul } = require('../lib/engine/questions');
-const { MODEL, enginePaths, readReady, fileUrl, ENGINE_VERSION } = require('../lib/engine/manifest');
+const { MODEL, enginePaths, readReady, readinessState, fileUrl, ENGINE_VERSION } = require('../lib/engine/manifest');
 
 const tok = new WordPiece({ model: { vocab: { '[PAD]': 0, '[UNK]': 1, '[CLS]': 2, '[SEP]': 3, hello: 4, world: 5, play: 6, '##ing': 7, ',': 8, cafe: 9, '中': 10 }, unk_token: '[UNK]', continuing_subword_prefix: '##', max_input_chars_per_word: 100 } });
 
@@ -1788,9 +1968,10 @@ test('VectorCache: concurrent writers never leave invalid JSON (Review Focus 5)'
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(f, 'utf8')));
 });
 
-test('manifest: pinned revision, URLs and READY validation', () => {
+test('manifest: pinned revision, URLs (incl. mirror) and READY validation', () => {
   assert.equal(MODEL.revision, '751bff37182d3f1213fa05d7196b954e230abad9');
-  assert.equal(fileUrl(MODEL.files[0]), 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_quantized.onnx');
+  assert.equal(fileUrl(MODEL.files[0], ''), 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_quantized.onnx');
+  assert.equal(fileUrl(MODEL.files[1], 'https://hf-mirror.example/'), 'https://hf-mirror.example/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/tokenizer.json');
   const data = tmpDir();
   assert.equal(readReady(data), null);
   const p = enginePaths(data);
@@ -1799,6 +1980,21 @@ test('manifest: pinned revision, URLs and READY validation', () => {
   assert.ok(readReady(data));
   write(p.ready, JSON.stringify({ engineVersion: ENGINE_VERSION, revision: 'other' }));
   assert.equal(readReady(data), null);
+});
+
+test('readinessState distinguishes missing, stale, broken, lite and ready (U12)', () => {
+  const data = tmpDir();
+  const p = enginePaths(data);
+  assert.equal(readinessState(data).state, 'missing');
+  write(p.ready, JSON.stringify({ engineVersion: ENGINE_VERSION - 1, revision: MODEL.revision }));
+  assert.equal(readinessState(data).state, 'stale');
+  write(p.ready, JSON.stringify({ engineVersion: ENGINE_VERSION, revision: MODEL.revision }));
+  assert.equal(readinessState(data).state, 'broken');
+  write(p.ready, JSON.stringify({ engineVersion: ENGINE_VERSION, mode: 'lite', reason: 'no binary' }));
+  assert.equal(readinessState(data).state, 'lite');
+  write(p.ready, JSON.stringify({ engineVersion: ENGINE_VERSION, revision: MODEL.revision }));
+  write(p.model, 'x'); write(p.tokenizer, '{}'); write(path.join(p.ortModule, 'package.json'), '{}');
+  assert.equal(readinessState(data).state, 'ready');
 });
 ```
 
@@ -1837,27 +2033,35 @@ function enginePaths(dataDir) {
   };
 }
 
-function fileUrl(f) {
-  return `https://huggingface.co/${MODEL.repo}/resolve/${MODEL.revision}/${f.remote}`;
+// HF_ENDPOINT lets users behind blocks use a mirror (U9); checksums still gate every file.
+function fileUrl(f, endpoint = process.env.HF_ENDPOINT) {
+  const base = String(endpoint || 'https://huggingface.co').replace(/\/+$/, '');
+  return `${base}/${MODEL.repo}/resolve/${MODEL.revision}/${f.remote}`;
 }
 
 function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-function readReady(dataDir) {
+// U12: distinguish why routing is unavailable so the user gets the right next step.
+// state: missing | stale (plugin updated, engine too old) | broken (files gone) | lite (no native engine) | ready
+function readinessState(dataDir) {
   const p = enginePaths(dataDir);
-  try {
-    const r = JSON.parse(fs.readFileSync(p.ready, 'utf8'));
-    if (r.engineVersion !== ENGINE_VERSION || r.revision !== MODEL.revision) return null;
-    if (!fs.existsSync(p.model) || !fs.existsSync(p.tokenizer) || !fs.existsSync(p.ortModule)) return null;
-    return r;
-  } catch {
-    return null;
-  }
+  let r;
+  try { r = JSON.parse(fs.readFileSync(p.ready, 'utf8')); } catch { return { state: 'missing', ready: null }; }
+  if (!r || r.engineVersion !== ENGINE_VERSION) return { state: 'stale', ready: r };
+  if (r.mode === 'lite') return { state: 'lite', ready: r };
+  if (r.revision !== MODEL.revision) return { state: 'stale', ready: r };
+  if (!fs.existsSync(p.model) || !fs.existsSync(p.tokenizer) || !fs.existsSync(p.ortModule)) return { state: 'broken', ready: r };
+  return { state: 'ready', ready: r };
 }
 
-module.exports = { ENGINE_VERSION, MODEL, enginePaths, fileUrl, sha256File, readReady };
+function readReady(dataDir) {
+  const s = readinessState(dataDir);
+  return s.state === 'ready' ? s.ready : null;
+}
+
+module.exports = { ENGINE_VERSION, MODEL, enginePaths, fileUrl, sha256File, readinessState, readReady };
 ```
 
 `plugins/jev-router/lib/engine/wordpiece.js`
@@ -2132,6 +2336,15 @@ test('decideLocal chooses an agent, scores difficulty, caches label vectors', as
   assert.ok(cache.get(agentText(agents[1])));
 });
 
+test('big catalogs warm up at most 40 new agent vectors per call (U14)', async () => {
+  const many = Array.from({ length: 60 }, (_, i) => ({ name: `agent-${i}`, description: `specialist number ${i} for topic${i}`, model: 'inherit', source: 'plugin' }));
+  const cache = new VectorCache(path.join(tmpDir(), 'v.json'));
+  const first = await decideLocal({ prompt: 'help with topic7', agents: many, shortlisted: [], embedder: fakeEmbedder, cache });
+  assert.equal(first.skippedAgents, 20);
+  const second = await decideLocal({ prompt: 'help with topic7', agents: many, shortlisted: [], embedder: fakeEmbedder, cache });
+  assert.equal(second.skippedAgents, 0);
+});
+
 test('combine blends 0.6 engine + 0.4 heuristic and ORs verbose', () => {
   const engine = { source: 'engine', difficulty: 3, difficultyDist: [0, 0, 0.4, 0.6], difficultyConf: 0.6, agent: null, agentConf: 0.2, verboseP: 0.2, verbose: false };
   const heur = { difficulty: 1, verbose: true };
@@ -2208,7 +2421,8 @@ class LocalEmbedder {
     const p = enginePaths(dataDir);
     const ort = require(p.ortModule);
     const tokenizer = new WordPiece(JSON.parse(fs.readFileSync(p.tokenizer, 'utf8')));
-    const session = await ort.InferenceSession.create(p.model, {
+    // Load from bytes, not a path: avoids native path-encoding bugs with non-ASCII user folders (U11).
+    const session = await ort.InferenceSession.create(fs.readFileSync(p.model), {
       executionProviders: ['cpu'],
       intraOpNumThreads: 1,
       interOpNumThreads: 1,
@@ -2267,6 +2481,7 @@ const VERBOSE = {
 };
 const MAIN = 'general conversation, answering a question directly, discussing options and deciding';
 const TOP_SEMANTIC = 12;
+const MAX_NEW_AGENT_EMBEDS = 40; // U14: warm big catalogs gradually instead of timing out forever
 
 function agentText(a) {
   return `${a.name.replace(/^[^:]+:/, '').replace(/[-_:]/g, ' ')}: ${a.description}`;
@@ -2274,16 +2489,27 @@ function agentText(a) {
 
 async function decideLocal({ prompt, agents, shortlisted, embedder, cache }) {
   const t0 = Date.now();
+  let fresh = 0;
   const vec = async text => {
     const hit = cache.get(text);
     if (hit) return hit;
     const v = await embedder.embed(text);
     cache.set(text, v);
+    if (++fresh % 20 === 0) cache.save(); // progress survives a hook timeout
     return v;
   };
   const sv = await embedder.embed(String(prompt).slice(0, 4000));
   const scored = [];
-  for (const a of agents) scored.push({ a, s: dot(sv, await vec(agentText(a))) });
+  let skippedAgents = 0;
+  let newAgentEmbeds = 0;
+  for (const a of agents) {
+    const text = agentText(a);
+    if (!cache.get(text)) {
+      if (newAgentEmbeds >= MAX_NEW_AGENT_EMBEDS) { skippedAgents++; continue; }
+      newAgentEmbeds++;
+    }
+    scored.push({ a, s: dot(sv, await vec(text)) });
+  }
   cache.save();
   scored.sort((x, y) => y.s - x.s);
   const pool = new Map();
@@ -2309,6 +2535,7 @@ async function decideLocal({ prompt, agents, shortlisted, embedder, cache }) {
     agentConf: ag.confidence,
     verboseP: vb.noul,
     verbose: vb.noul >= 0.7,
+    skippedAgents,
     latencyMs: Date.now() - t0,
   };
 }
@@ -2427,7 +2654,7 @@ module.exports = { decide, decideLocal, decideRemote, parseRemote, combine, agen
 
 **Interfaces:**
 - Consumes: manifest, `LocalEmbedder`, `dot`, `loadCatalog`, `VectorCache`, `agentText`.
-- Produces: `pruneOtherPlatforms(ortDir, platform?, arch?) → number`; `downloadVerified(url, dest, sha256, fetchImpl?)`; `parseArgs(argv) → {data, uninstall}`; CLI `node scripts/setup.js --data <dir> [--uninstall]`.
+- Produces: `pruneOtherPlatforms(ortDir, platform?, arch?) → number`; `downloadVerified(url, dest, sha256, fetchImpl?)`; `parseArgs(argv) → {data, uninstall, lite, modelDir}`; `preflight(dataDir, {needNpm, spawn}) → string[]`; `acquireLock(root, now?) → release()`; `platformSupported(ortDir, platform?, arch?) → boolean`; `importFromDir(srcDir, dest, file)`; `downloadHelp(err, env?) → string`; CLI `node scripts/setup.js --data <dir> [--lite | --uninstall | --model-dir <folder>]`. READY.json may carry `mode: "lite"` + `reason`.
 
 - [ ] **Step 1: Engine package and lockfile**
 
@@ -2459,11 +2686,67 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { tmpDir, write } = require('./helpers');
-const { pruneOtherPlatforms, downloadVerified, parseArgs } = require('../scripts/setup');
+const { pruneOtherPlatforms, downloadVerified, parseArgs, preflight, acquireLock, platformSupported, importFromDir, downloadHelp } = require('../scripts/setup');
+
+const bytes = Buffer.from('model-bytes');
+const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+const okFetch = async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) });
 
 test('parseArgs', () => {
-  assert.deepEqual(parseArgs(['--data', '/d', '--uninstall']), { data: '/d', uninstall: true });
-  assert.deepEqual(parseArgs([]), { data: null, uninstall: false });
+  assert.deepEqual(parseArgs(['--data', '/d', '--uninstall']), { data: '/d', uninstall: true, lite: false, modelDir: null });
+  assert.deepEqual(parseArgs([]), { data: null, uninstall: false, lite: false, modelDir: null });
+  assert.deepEqual(parseArgs(['--lite', '--model-dir', 'm']), { data: null, uninstall: false, lite: true, modelDir: 'm' });
+});
+
+test('preflight: npm check, writability (U2, U10)', () => {
+  const dir = tmpDir();
+  assert.deepEqual(preflight(dir, { spawn: () => ({ status: 0 }) }), []);
+  assert.match(preflight(dir, { spawn: () => ({ status: 1 }) }).join('\n'), /npm was not found.*--lite/);
+  assert.deepEqual(preflight(dir, { needNpm: false, spawn: () => { throw new Error('must not spawn'); } }), []);
+  const file = write(path.join(dir, 'a-file'), 'x');
+  assert.match(preflight(path.join(file, 'sub'), { needNpm: false }).join('\n'), /Cannot write to/);
+});
+
+test('acquireLock: exclusive, stale locks expire, release frees it (U10)', () => {
+  const root = tmpDir();
+  const release = acquireLock(root);
+  assert.throws(() => acquireLock(root), /already running/);
+  release();
+  const again = acquireLock(root);
+  const lock = path.join(root, '.setup.lock');
+  const old = (Date.now() - 11 * 60 * 1000) / 1000;
+  fs.utimesSync(lock, old, old);
+  const stolen = acquireLock(root);
+  stolen();
+  assert.equal(fs.existsSync(lock), false);
+  again();
+});
+
+test('platformSupported reads the shipped binary folders (U8)', () => {
+  const ort = tmpDir();
+  write(path.join(ort, 'bin', 'napi-v6', 'darwin', 'arm64', 'x.node'), 'x');
+  assert.equal(platformSupported(ort, 'darwin', 'arm64'), true);
+  assert.equal(platformSupported(ort, 'darwin', 'x64'), false);
+  assert.equal(platformSupported(path.join(ort, 'none'), 'linux', 'x64'), false);
+});
+
+test('importFromDir copies only checksum-matching files (U9)', () => {
+  const src = tmpDir();
+  const dest = path.join(tmpDir(), 'model', 'model.onnx');
+  const f = { remote: 'onnx/model_quantized.onnx', local: 'model.onnx', sha256: sha };
+  write(path.join(src, 'model_quantized.onnx'), bytes);
+  importFromDir(src, dest, f);
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'model-bytes');
+  assert.throws(() => importFromDir(src, dest, { ...f, sha256: '0'.repeat(64) }), /checksum mismatch/);
+  assert.throws(() => importFromDir(tmpDir(), dest, f), /not found/);
+});
+
+test('downloadHelp gives proxy, mirror and manual-download guidance (U9)', () => {
+  const msg = downloadHelp(new Error('ECONNRESET'), { HTTPS_PROXY: 'http://proxy:8080' });
+  assert.match(msg, /NODE_USE_ENV_PROXY=1/);
+  assert.match(msg, /HF_ENDPOINT/);
+  assert.match(msg, /resolve\/751bff37182d3f1213fa05d7196b954e230abad9\/tokenizer\.json/);
+  assert.doesNotMatch(downloadHelp(new Error('x'), {}), /NODE_USE_ENV_PROXY/);
 });
 
 test('pruneOtherPlatforms keeps only the host platform/arch', () => {
@@ -2475,10 +2758,6 @@ test('pruneOtherPlatforms keeps only the host platform/arch', () => {
   assert.ok(!fs.existsSync(path.join(ort, 'bin', 'napi-v6', 'win32')));
   assert.equal(pruneOtherPlatforms(path.join(ort, 'missing')), 0);
 });
-
-const bytes = Buffer.from('model-bytes');
-const sha = crypto.createHash('sha256').update(bytes).digest('hex');
-const okFetch = async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) });
 
 test('downloadVerified writes the file only when the checksum matches', async () => {
   const dir = tmpDir();
@@ -2512,12 +2791,90 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const say = m => process.stdout.write(m + '\n');
 
 function parseArgs(argv) {
-  const a = { data: null, uninstall: false };
+  const a = { data: null, uninstall: false, lite: false, modelDir: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--data') a.data = argv[++i] || null;
     else if (argv[i] === '--uninstall') a.uninstall = true;
+    else if (argv[i] === '--lite') a.lite = true;
+    else if (argv[i] === '--model-dir') a.modelDir = argv[++i] || null;
   }
   return a;
+}
+
+const MIN_FREE_BYTES = 300 * 1024 * 1024;
+
+// U2/U10: catch the common blockers before downloading anything.
+function preflight(dataDir, { needNpm = true, spawn = spawnSync } = {}) {
+  const problems = [];
+  const major = Number(process.versions.node.split('.')[0]);
+  if (major < 18) problems.push(`Node ${process.version} is too old — jev-router needs Node 18+. Install the current LTS from https://nodejs.org and re-run.`);
+  if (needNpm) {
+    const npm = spawn('npm', ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' });
+    if (!npm || npm.status !== 0) problems.push('npm was not found on PATH. Install Node.js (it includes npm) and re-run — or run setup with --lite for rule-based routing without the engine.');
+  }
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const probe = path.join(dataDir, `.write-test-${process.pid}`);
+    fs.writeFileSync(probe, 'ok');
+    fs.rmSync(probe);
+  } catch (e) {
+    problems.push(`Cannot write to ${dataDir} (${e.code || e.message}). Check that folder's permissions and re-run.`);
+  }
+  if (typeof fs.statfsSync === 'function') {
+    try {
+      const s = fs.statfsSync(dataDir);
+      const free = Number(s.bavail) * Number(s.bsize);
+      if (free < MIN_FREE_BYTES) problems.push(`Only ${Math.round(free / 1048576)} MB free at ${dataDir}; setup needs about 300 MB. Free some space and re-run.`);
+    } catch {
+      // statfs unsupported on this filesystem: skip the disk check.
+    }
+  }
+  return problems;
+}
+
+// U10: one setup at a time; a crashed setup's lock expires after 10 minutes.
+function acquireLock(root, now = Date.now()) {
+  fs.mkdirSync(root, { recursive: true });
+  const lock = path.join(root, '.setup.lock');
+  try {
+    fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    if (now - fs.statSync(lock).mtimeMs < 10 * 60 * 1000) {
+      throw new Error(`Another jev-router setup is already running. Wait for it to finish, or delete ${lock} if it crashed.`);
+    }
+    fs.rmSync(lock, { force: true });
+    fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
+  }
+  return () => fs.rmSync(lock, { force: true });
+}
+
+// U8: onnxruntime-node ships binaries only for some OS/arch pairs (e.g. no Intel macOS).
+function platformSupported(ortDir, platform = process.platform, arch = process.arch) {
+  try {
+    return fs.readdirSync(path.join(ortDir, 'bin')).some(napi => fs.existsSync(path.join(ortDir, 'bin', napi, platform, arch)));
+  } catch {
+    return false;
+  }
+}
+
+// U9: offline / air-gapped install from manually downloaded files, still checksum-verified.
+function importFromDir(srcDir, dest, f) {
+  const candidates = [path.join(srcDir, f.local), path.join(srcDir, path.basename(f.remote))];
+  const src = candidates.find(c => fs.existsSync(c));
+  if (!src) throw new Error(`--model-dir: ${f.local} (or ${path.basename(f.remote)}) not found in ${srcDir}`);
+  const got = sha256File(src);
+  if (got !== f.sha256) throw new Error(`checksum mismatch for ${src}: expected ${f.sha256}, got ${got}`);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(src, dest);
+}
+
+function downloadHelp(err, env = process.env) {
+  const lines = [`Download failed: ${err.message}`];
+  if (env.HTTPS_PROXY || env.https_proxy) lines.push('A proxy is configured: Node uses it only with NODE_USE_ENV_PROXY=1 (Node 24+). Re-run with that set, or use --model-dir.');
+  lines.push('If Hugging Face is blocked, set HF_ENDPOINT to a mirror (files are still checksum-verified), or download these two files by hand and re-run with --model-dir <folder>:');
+  for (const f of MODEL.files) lines.push(`  ${fileUrl(f, '')}`);
+  return lines.join('\n');
 }
 
 function pruneOtherPlatforms(ortDir, platform = process.platform, arch = process.arch) {
@@ -2593,37 +2950,66 @@ async function warmCatalog(dataDir, embedder) {
   return agents.length;
 }
 
-async function install(dataDir) {
-  const p = enginePaths(dataDir);
-  say(`jev-router setup → ${p.root}`);
-  say('One-time downloads: onnxruntime-node from npm and all-MiniLM-L6-v2 (23 MB) from Hugging Face, pinned and checksum-verified. Nothing about you or your code is uploaded.');
+function writeReady(p, extra = {}) {
   fs.mkdirSync(p.root, { recursive: true });
-  for (const f of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(PLUGIN_ROOT, 'engine', f), path.join(p.root, f));
-  if (fs.existsSync(path.join(p.ortModule, 'package.json'))) {
-    say('• onnxruntime-node already installed');
-  } else {
-    say('• npm ci (install scripts disabled)…');
-    npmCi(p.root);
-  }
-  say(`• pruned ${pruneOtherPlatforms(p.ortModule)} binary folders for other platforms`);
-  for (const f of MODEL.files) {
-    const dest = path.join(p.modelDir, f.local);
-    if (fs.existsSync(dest) && sha256File(dest) === f.sha256) { say(`• ${f.local}: checksum OK`); continue; }
-    say(`• downloading ${f.remote} @ ${MODEL.revision.slice(0, 7)}…`);
-    await downloadVerified(fileUrl(f), dest, f.sha256);
-    say(`• ${f.local}: checksum OK`);
-  }
-  const { ms, embedder } = await selfTest(dataDir);
-  say(`• self-test passed (${ms} ms including model load)`);
-  say(`• pre-computed vectors for ${await warmCatalog(dataDir, embedder)} agents`);
   fs.writeFileSync(p.ready, JSON.stringify({
     engineVersion: ENGINE_VERSION,
     revision: MODEL.revision,
     installedAt: new Date().toISOString(),
     platform: `${process.platform}-${process.arch}`,
     node: process.version,
+    ...extra,
   }, null, 2));
-  say('jev-router: local engine ready. Prompt routing is active; nothing leaves this machine.');
+}
+
+// U8: when the native engine can't run here, routing still works on built-in rules.
+function goLite(p, reason) {
+  writeReady(p, { mode: 'lite', reason });
+  say(`• lite mode: ${reason}`);
+  say('jev-router: routing will use built-in rules (less accurate than the engine). The tool guard is fully active. Run /jev-router:doctor for details.');
+}
+
+async function install(dataDir, { lite = false, modelDir = null } = {}) {
+  const p = enginePaths(dataDir);
+  if (lite) { goLite(p, 'requested with --lite'); return; }
+  say(`jev-router setup → ${p.root}`);
+  say('One-time downloads: onnxruntime-node from npm and all-MiniLM-L6-v2 (23 MB) from Hugging Face, pinned and checksum-verified. Nothing about you or your code is uploaded.');
+  const release = acquireLock(p.root);
+  try {
+    for (const f of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(PLUGIN_ROOT, 'engine', f), path.join(p.root, f));
+    if (fs.existsSync(path.join(p.ortModule, 'package.json'))) {
+      say('• onnxruntime-node already installed');
+    } else {
+      say('• npm ci (install scripts disabled)…');
+      npmCi(p.root);
+    }
+    if (!platformSupported(p.ortModule)) { goLite(p, `onnxruntime has no binary for ${process.platform}-${process.arch}`); return; }
+    say(`• pruned ${pruneOtherPlatforms(p.ortModule)} binary folders for other platforms`);
+    for (const f of MODEL.files) {
+      const dest = path.join(p.modelDir, f.local);
+      if (fs.existsSync(dest) && sha256File(dest) === f.sha256) { say(`• ${f.local}: checksum OK`); continue; }
+      if (modelDir) {
+        importFromDir(modelDir, dest, f);
+      } else {
+        say(`• downloading ${f.remote} @ ${MODEL.revision.slice(0, 7)}…`);
+        try { await downloadVerified(fileUrl(f), dest, f.sha256); } catch (e) { throw new Error(downloadHelp(e)); }
+      }
+      say(`• ${f.local}: checksum OK`);
+    }
+    let tested;
+    try {
+      tested = await selfTest(dataDir);
+    } catch (e) {
+      goLite(p, `the engine could not start on this machine (${String(e.message).split('\n')[0]}), e.g. blocked by Smart App Control/antivirus or an unsupported C library`);
+      return;
+    }
+    say(`• self-test passed (${tested.ms} ms including model load)`);
+    say(`• pre-computed vectors for ${await warmCatalog(dataDir, tested.embedder)} agents`);
+    writeReady(p);
+    say('jev-router: local engine ready. Prompt routing is active; nothing leaves this machine.');
+  } finally {
+    release();
+  }
 }
 
 function uninstall(dataDir) {
@@ -2636,13 +3022,21 @@ function uninstall(dataDir) {
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const dataDir = path.resolve(args.data || loadConfig().dataDir);
+  const problems = args.uninstall ? [] : preflight(dataDir, { needNpm: !args.lite });
+  if (problems.length) {
+    process.stderr.write(`jev-router setup cannot continue:\n${problems.map(p => `  ✗ ${p}`).join('\n')}\n`);
+    process.exit(1);
+  }
   Promise.resolve()
-    .then(() => (args.uninstall ? uninstall(dataDir) : install(dataDir)))
+    .then(() => (args.uninstall ? uninstall(dataDir) : install(dataDir, args)))
     .then(() => process.exit(0))
-    .catch(e => { process.stderr.write(`jev-router setup failed: ${e.message}\n`); process.exit(1); });
+    .catch(e => {
+      process.stderr.write(`jev-router setup failed:\n${e.message}\nNext step: run /jev-router:doctor, or re-run setup (it resumes safely).\n`);
+      process.exit(1);
+    });
 }
 
-module.exports = { pruneOtherPlatforms, downloadVerified, parseArgs };
+module.exports = { pruneOtherPlatforms, downloadVerified, parseArgs, preflight, acquireLock, platformSupported, importFromDir, downloadHelp };
 ```
 
 `plugins/jev-router/skills/setup/SKILL.md`
@@ -2650,7 +3044,7 @@ module.exports = { pruneOtherPlatforms, downloadVerified, parseArgs };
 ---
 description: Install (or remove with --uninstall) jev-router's local decision engine. One-time ~100 MB download of pinned, checksum-verified files; afterwards routing runs fully offline. Run only when the user invokes /jev-router:setup.
 disable-model-invocation: true
-argument-hint: "[--uninstall]"
+argument-hint: "[--lite | --uninstall | --model-dir <folder>]"
 ---
 
 Run exactly this command with the Bash tool (timeout 600000 ms) and then show the user its output verbatim. Do not change the command or retry it with different flags. If it fails, show the error and suggest `/jev-router:doctor`.
@@ -2673,6 +3067,11 @@ Expected, in order:
 
 Run it again. Expected: `already installed` and both `checksum OK`, with no downloads.
 Then run `node plugins/jev-router/scripts/setup.js --data .engine-test --uninstall` followed by a fresh install. Expected: the engine dir is removed, then reinstalled.
+Hardening paths, each on a scratch data dir:
+- `--lite` → `lite mode: requested with --lite`, and READY.json has `"mode": "lite"`.
+- `--model-dir .engine-test/engine/model` → installs without any Hugging Face request (both files `checksum OK`).
+- Two setups started at the same time → the second prints `already running` and exits 1.
+- `HF_ENDPOINT=https://invalid.example` → exit 1 with the proxy/mirror/manual-download guidance, and no partial files left under `engine/model`.
 **If onnxruntime-node fails to load with `--ignore-scripts`:** inspect `node_modules/onnxruntime-node/script/install.js`. Only if the CPU binaries are genuinely missing from the tarball, drop `--ignore-scripts`, record why in spec §3, and re-run.
 
 - [ ] **Step 7: Commit** → `git add -A && git commit -m "feat(jev-router): /jev-router:setup installs the pinned local engine" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
@@ -2700,7 +3099,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
-const { SCRIPTS, runScript, hookEnv } = require('./helpers');
+const { SCRIPTS, runScript, hookEnv, write } = require('./helpers');
+const { enginePaths, ENGINE_VERSION } = require('../lib/engine/manifest');
 
 const route = path.join(SCRIPTS, 'route-prompt.js');
 const start = path.join(SCRIPTS, 'session-start.js');
@@ -2724,6 +3124,32 @@ test('session-start shows the setup reminder until the engine is ready', async (
   assert.match(r.json.systemMessage, /run \/jev-router:setup/);
   const off = await runScript(start, {}, hookEnv({ CLAUDE_PLUGIN_OPTION_MODE: 'guard-only' }).env);
   assert.equal(off.stdout, '');
+});
+
+test('reminder is throttled to once per day per state; a new state shows at once (U12, U13)', async () => {
+  const h = hookEnv();
+  const first = await runScript(start, {}, h.env);
+  assert.match(first.json.systemMessage, /routing is off/);
+  const second = await runScript(start, {}, h.env);
+  assert.equal(second.stdout, '');
+  const p = enginePaths(h.data);
+  write(p.ready, JSON.stringify({ engineVersion: 0, revision: 'old' }));
+  const stale = await runScript(start, {}, h.env);
+  assert.match(stale.json.systemMessage, /was updated/);
+  fs.writeFileSync(path.join(h.data, 'reminder.json'), JSON.stringify({ state: 'stale', ts: Date.now() - 25 * 3600 * 1000 }));
+  const nextDay = await runScript(start, {}, h.env);
+  assert.match(nextDay.json.systemMessage, /was updated/);
+});
+
+test('lite mode: no reminder, and prompts are routed on built-in rules (U8)', async () => {
+  const h = hookEnv();
+  write(enginePaths(h.data).ready, JSON.stringify({ engineVersion: ENGINE_VERSION, mode: 'lite', reason: 'test' }));
+  const s = await runScript(start, {}, h.env);
+  assert.equal(s.stdout, '');
+  const r = await runScript(route, { prompt: 'where is the rate limiter implemented?', session_id: 's', cwd: h.config }, h.env);
+  assert.match(r.json.hookSpecificOutput.additionalContext, /^\[jev-router\] simple \(0\.60\)/);
+  const rec = JSON.parse(fs.readFileSync(path.join(h.data, 'decisions.jsonl'), 'utf8').trim());
+  assert.equal(rec.source, 'heuristic');
 });
 
 test('route-prompt is silent (hard gate) before setup and logs nothing', async () => {
@@ -2755,7 +3181,7 @@ test('route-prompt with a loopback JEV-compatible server emits a hint and logs a
   const r = await runScript(route, { prompt, session_id: 's1', cwd: h.config }, h.env);
   s.close();
   assert.equal(r.json.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
-  assert.match(r.json.hookSpecificOutput.additionalContext, /^\[jev-router\] simple .*subagent_type="Explore"/);
+  assert.match(r.json.hookSpecificOutput.additionalContext, /^\[jev-router\] simple .*delegate to subagent "Explore"/);
   const log = fs.readFileSync(path.join(h.data, 'decisions.jsonl'), 'utf8');
   assert.match(log, /"source":"remote"/);
   assert.ok(!log.includes('secret-rate-limiter'));
@@ -2806,12 +3232,13 @@ const { shortlist } = require('../lib/shortlist');
 const heuristics = require('../lib/heuristics');
 const { toHint } = require('../lib/policy');
 const { decide, combine } = require('../lib/engine');
-const { readReady } = require('../lib/engine/manifest');
+const { readinessState } = require('../lib/engine/manifest');
 const { appendCapped, fingerprint } = require('../lib/log');
 
 const cfg = loadConfig();
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const round = x => Number((x || 0).toFixed(2));
+const ROUTABLE = ['ready', 'lite', 'remote'];
 
 runHook('route-prompt', 7000, async (input) => {
   if (cfg.mode !== 'advise') return null;
@@ -2822,7 +3249,8 @@ runHook('route-prompt', 7000, async (input) => {
     logError(cfg.dataDir, 'route-prompt', new Error('ignored non-loopback JEV_BASE_URL'));
     return null;
   }
-  if (!useRemote && !readReady(cfg.dataDir)) return null;
+  const state = useRemote ? 'remote' : readinessState(cfg.dataDir).state;
+  if (!ROUTABLE.includes(state)) return null; // hard gate: missing / stale / broken
 
   const projectDir = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const { agents } = loadCatalog({ configDir: cfg.configDir, projectDir, dataDir: cfg.dataDir, pluginRoot: PLUGIN_ROOT });
@@ -2831,13 +3259,15 @@ runHook('route-prompt', 7000, async (input) => {
 
   let final = null;
   let error;
-  try {
-    const d = await decide({ prompt, agents, shortlisted, cfg, useRemote });
-    if (d) final = combine(d, heur);
-  } catch (e) {
-    error = e.message;
+  if (state !== 'lite') { // U8: lite mode routes on built-in rules only
+    try {
+      const d = await decide({ prompt, agents, shortlisted, cfg, useRemote });
+      if (d) final = combine(d, heur);
+    } catch (e) {
+      error = e.message;
+    }
   }
-  if (!final) final = { ...heur, source: 'heuristic-fallback' };
+  if (!final) final = { ...heur, source: state === 'lite' ? 'heuristic' : 'heuristic-fallback' };
 
   const hint = toHint(final, { agentsByName: new Map(agents.map(a => [a.name, a])) });
   appendCapped(path.join(cfg.dataDir, 'decisions.jsonl'), {
@@ -2861,19 +3291,38 @@ runHook('route-prompt', 7000, async (input) => {
 ```js
 #!/usr/bin/env node
 'use strict';
+const fs = require('fs');
+const path = require('path');
 const { loadConfig, isLoopbackUrl } = require('../lib/config');
 const { runHook } = require('../lib/hookio');
-const { readReady } = require('../lib/engine/manifest');
+const { readinessState } = require('../lib/engine/manifest');
 
 const cfg = loadConfig();
+const DAY_MS = 24 * 3600 * 1000;
+// U12: one message per state, each with its own next step. lite/ready stay silent.
+const MESSAGES = {
+  missing: 'jev-router: prompt routing is off until you run /jev-router:setup (one-time ~100 MB local engine; nothing leaves your machine). The tool guard is already active.',
+  stale: 'jev-router was updated and its local engine needs a refresh: run /jev-router:setup (routing is paused until then).',
+  broken: 'jev-router: the local engine files are missing or damaged. Run /jev-router:setup to repair them (routing is paused).',
+};
+
+// U13: at most once per 24 h for the same state, so headless/cloud sessions aren't spammed.
+function shouldRemind(state, now = Date.now()) {
+  const file = path.join(cfg.dataDir, 'reminder.json');
+  let last = null;
+  try { last = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { last = null; }
+  if (last && last.state === state && now - last.ts < DAY_MS) return false;
+  fs.mkdirSync(cfg.dataDir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ state, ts: now }));
+  return true;
+}
 
 runHook('session-start', 3000, async () => {
   if (cfg.mode !== 'advise') return null;
   if (cfg.jevBaseUrl && isLoopbackUrl(cfg.jevBaseUrl)) return null;
-  if (readReady(cfg.dataDir)) return null;
-  return {
-    systemMessage: 'jev-router: prompt routing is off until you run /jev-router:setup (one-time ~100 MB local engine; nothing leaves your machine). The tool guard is already active.',
-  };
+  const { state } = readinessState(cfg.dataDir);
+  if (!MESSAGES[state] || !shouldRemind(state)) return null;
+  return { systemMessage: MESSAGES[state] };
 }, cfg.dataDir);
 ```
 
@@ -2955,6 +3404,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { hookEnv, write, SCRIPTS } = require('./helpers');
+const { enginePaths, ENGINE_VERSION } = require('../lib/engine/manifest');
 
 test('doctor reports engine state, agents, decisions and guard counts', () => {
   const h = hookEnv({ JEV_BASE_URL: 'https://api.typesafe.ai' });
@@ -2966,7 +3416,29 @@ test('doctor reports engine state, agents, decisions and guard counts', () => {
   assert.match(r.stdout, /JEV_BASE_URL: REFUSED/);
   assert.match(r.stdout, /agents: \d+ \(builtin 3/);
   assert.match(r.stdout, /heuristic-fallback diff=1/);
-  assert.match(r.stdout, /guard: 1 denied, 1 allowed on repeat, 1 outputs trimmed/);
+  assert.match(r.stdout, /guard: 1 denied, 1 allowed on repeat, 0 after the per-session limit, 1 outputs trimmed/);
+  assert.match(r.stdout, /run it in your own terminal: node ".*setup\.js" --data "/);
+  assert.match(r.stdout, /npm .+ · (win32|linux|darwin)-/);
+});
+
+test('doctor names lite and stale states with their next step (U8, U12)', () => {
+  const h = hookEnv();
+  const run = () => spawnSync(process.execPath, [path.join(SCRIPTS, 'doctor.js'), '--data', h.data], { env: { ...process.env, ...h.env }, encoding: 'utf8', cwd: h.config }).stdout;
+  const ready = enginePaths(h.data).ready;
+  write(ready, JSON.stringify({ engineVersion: ENGINE_VERSION, mode: 'lite', reason: 'no binary for darwin-x64' }));
+  assert.match(run(), /LITE MODE — routing uses built-in rules \(reason: no binary for darwin-x64\)/);
+  write(ready, JSON.stringify({ engineVersion: ENGINE_VERSION - 1, revision: 'old' }));
+  assert.match(run(), /UPDATE REQUIRED/);
+});
+
+test('doctor warns about other plugins rewriting Bash output when trimming is on (U19)', () => {
+  const h = hookEnv({ CLAUDE_PLUGIN_OPTION_TRIM_OUTPUT_LINES: '600' });
+  const other = path.join(h.config, 'plugins', 'cache', 'mk', 'rewriter', '1.0.0');
+  write(path.join(other, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { PostToolUse: [{ matcher: 'Bash|Edit', hooks: [] }] } }));
+  write(path.join(h.config, 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'rewriter@mk': [{ scope: 'user', installPath: other }] } }));
+  write(path.join(h.config, 'settings.json'), JSON.stringify({ enabledPlugins: { 'rewriter@mk': true } }));
+  const r = spawnSync(process.execPath, [path.join(SCRIPTS, 'doctor.js'), '--data', h.data], { env: { ...process.env, ...h.env }, encoding: 'utf8', cwd: h.config });
+  assert.match(r.stdout, /⚠ output trimming is on and rewriter also rewrite Bash output/);
 });
 ```
 
@@ -2980,23 +3452,86 @@ test('doctor reports engine state, agents, decisions and guard counts', () => {
 'use strict';
 const path = require('path');
 const { loadConfig, isLoopbackUrl } = require('../lib/config');
-const { readReady, enginePaths, MODEL, sha256File } = require('../lib/engine/manifest');
-const { loadCatalog } = require('../lib/catalog');
+const fs = require('fs');
+const { spawnSync } = require('child_process');
+const { readinessState, enginePaths, MODEL, sha256File } = require('../lib/engine/manifest');
+const { loadCatalog, enabledPluginInstalls } = require('../lib/catalog');
 const { readTail } = require('../lib/log');
+
+const PLUGIN_ROOT = path.resolve(__dirname, '..');
 
 function argData(argv) {
   const i = argv.indexOf('--data');
   return i >= 0 ? argv[i + 1] : null;
 }
 
+function npmVersion() {
+  const r = spawnSync('npm', ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' });
+  return r.status === 0 ? r.stdout.trim() : 'not found';
+}
+
+function dirSizeMb(dir) {
+  let total = 0;
+  const walk = d => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else { try { total += fs.statSync(p).size; } catch { /* vanished */ } }
+    }
+  };
+  walk(dir);
+  return Math.round(total / 1048576);
+}
+
+function percentile(values, q) {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * q))];
+}
+
+// U19: other enabled plugins that hook the same tools/events.
+function hookNeighbours(cfg) {
+  const out = { pre: [], postBash: [] };
+  for (const p of enabledPluginInstalls(cfg.configDir, process.cwd())) {
+    if (p.plugin === 'jev-router') continue;
+    let hooks;
+    try { hooks = JSON.parse(fs.readFileSync(path.join(p.installPath, 'hooks', 'hooks.json'), 'utf8')).hooks || {}; } catch { continue; }
+    const matches = (matcher, tool) => {
+      try { return new RegExp(`^(${matcher})$`).test(tool); } catch { return false; } // other plugins' matchers may be odd
+    };
+    const touches = (event, tool) => (hooks[event] || []).some(h => !h.matcher || matches(h.matcher, tool));
+    if (['Read', 'Bash', 'Grep'].some(t => touches('PreToolUse', t))) out.pre.push(p.plugin);
+    if (touches('PostToolUse', 'Bash')) out.postBash.push(p.plugin);
+  }
+  return out;
+}
+
 async function main() {
   const cfg = loadConfig();
   const dataDir = path.resolve(argData(process.argv.slice(2)) || cfg.dataDir);
-  const out = ['jev-router doctor', `node ${process.version} · mode ${cfg.mode} · data ${dataDir}`];
+  const out = [
+    'jev-router doctor',
+    `node ${process.version} · npm ${npmVersion()} · ${process.platform}-${process.arch} · mode ${cfg.mode}`,
+    `data ${dataDir}`,
+  ];
+  if (Number(process.versions.node.split('.')[0]) < 18) out.push('  ✗ Node 18+ is required; hooks are inactive on this Node. Install the current LTS from https://nodejs.org');
 
-  const ready = readReady(dataDir);
-  if (!ready) {
+  const { state, ready } = readinessState(dataDir);
+  const manual = `node "${path.join(PLUGIN_ROOT, 'scripts', 'setup.js')}" --data "${dataDir}"`;
+  if (state === 'missing') {
     out.push('engine: NOT INSTALLED — run /jev-router:setup (prompt routing is off; the tool guard still works)');
+    out.push(`  if setup is blocked in-session, run it in your own terminal: ${manual}`);
+  } else if (state === 'stale') {
+    out.push('engine: UPDATE REQUIRED — the plugin was updated; run /jev-router:setup (routing is paused)');
+    out.push(`  or in your terminal: ${manual}`);
+  } else if (state === 'broken') {
+    out.push('engine: DAMAGED — files are missing; run /jev-router:setup to repair (routing is paused)');
+    out.push(`  or in your terminal: ${manual}`);
+  } else if (state === 'lite') {
+    out.push(`engine: LITE MODE — routing uses built-in rules (reason: ${ready.reason || 'unknown'})`);
+    out.push('  to try the full engine again: /jev-router:setup');
   } else {
     const p = enginePaths(dataDir);
     const bad = MODEL.files.filter(f => {
@@ -3012,15 +3547,16 @@ async function main() {
       await e.embed('where is the rate limiter implemented?');
       out.push(`  ✓ self-test: model load ${t1 - t0} ms, one prompt ${Date.now() - t1} ms`);
     } catch (e) {
-      out.push(`  ✗ self-test failed: ${e.message}`);
+      out.push(`  ✗ self-test failed: ${e.message} — re-run /jev-router:setup (it falls back to lite mode if the engine can't run here)`);
     }
+    out.push(`  disk: ${dirSizeMb(p.root)} MB in ${p.root} (removed automatically when you uninstall the plugin)`);
   }
 
   if (cfg.jevBaseUrl) {
     out.push(`JEV_BASE_URL: ${isLoopbackUrl(cfg.jevBaseUrl) ? 'loopback ✓ (used instead of the built-in engine)' : 'REFUSED — not a loopback address'}`);
   }
 
-  const cat = loadCatalog({ configDir: cfg.configDir, projectDir: process.cwd(), dataDir, pluginRoot: path.resolve(__dirname, '..') });
+  const cat = loadCatalog({ configDir: cfg.configDir, projectDir: process.cwd(), dataDir, pluginRoot: PLUGIN_ROOT });
   const counts = Object.entries(cat.counts).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(', ');
   const dups = [...new Set(cat.duplicates)];
   out.push(`agents: ${cat.agents.length} (${counts})${dups.length ? ` · duplicates skipped: ${dups.join(', ')}` : ''}`);
@@ -3031,9 +3567,16 @@ async function main() {
     out.push(`  ${d.ts} ${d.source} diff=${d.difficulty} (${d.conf}) agent=${d.agent || '-'} (${d.agentConf}) hint=${d.hintChars}c ${d.latencyMs}ms${d.error ? ` error=${d.error}` : ''}`);
   }
 
+  const recent = readTail(path.join(dataDir, 'decisions.jsonl'), 200).filter(d => d.source === 'engine').map(d => d.latencyMs);
+  if (recent.length) out.push(`engine latency (last ${recent.length}): p50 ${percentile(recent, 0.5)} ms, p95 ${percentile(recent, 0.95)} ms`);
+
   const guard = readTail(path.join(dataDir, 'guard.jsonl'), 500);
   const c = guard.reduce((m, g) => { m[g.action] = (m[g.action] || 0) + 1; return m; }, {});
-  out.push(`guard: ${c.deny || 0} denied, ${c['allowed-repeat'] || 0} allowed on repeat, ${c.trim || 0} outputs trimmed`);
+  out.push(`guard: ${c.deny || 0} denied, ${c['allowed-repeat'] || 0} allowed on repeat, ${c['breaker-open'] || 0} after the per-session limit, ${c.trim || 0} outputs trimmed`);
+
+  const n = hookNeighbours(cfg);
+  if (n.pre.length) out.push(`other plugins also hooking Read/Bash/Grep: ${n.pre.join(', ')} (fine; jev-router never auto-approves)`);
+  if (n.postBash.length && cfg.trimOutputLines) out.push(`  ⚠ output trimming is on and ${n.postBash.join(', ')} also rewrite Bash output — set trim_output_lines to 0 if results look odd`);
   out.push('privacy: no prompt text is stored; the engine runs offline after setup.');
   process.stdout.write(out.join('\n') + '\n');
 }
@@ -3061,9 +3604,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/doctor.js" --data "${CLAUDE_PLUGIN_DATA}"
 
 **Files:**
 - Create: `plugins/jev-router/test/engine.integration.test.js`, `.github/workflows/ci.yml`
+- Create: `scripts/check-version-bump.js`, `plugins/jev-router/test/version-bump.test.js`, `CHANGELOG.md`
 
 **Interfaces:**
 - Consumes: a real engine installed at `JEV_ENGINE_DATA` (default `<repo>/.engine-test`).
+- Produces: `needsBump({changed, headVersion, baseVersion}) → {ok, message}` in `scripts/check-version-bump.js`.
 
 - [ ] **Step 1: Write the integration test**
 
@@ -3190,13 +3735,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly: catch breakage from new Node / onnxruntime / Claude Code releases (U16)
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [20, 22]
     runs-on: ${{ matrix.os }}
     steps:
@@ -3228,19 +3779,109 @@ jobs:
         run: |
           npx -y @anthropic-ai/claude-code plugin validate --strict plugins/jev-router
           npx -y @anthropic-ai/claude-code plugin validate --strict .
+
+  version-bump:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Shipped plugin changes must bump the version (users only get updates when it changes)
+        run: node scripts/check-version-bump.js "origin/${{ github.base_ref }}"
 ```
 
 Run locally: `claude plugin validate --strict plugins/jev-router` and `claude plugin validate --strict .` → Expected: clean. Fix anything `--strict` flags before committing.
 
-- [ ] **Step 4: Commit** → `git add -A && git commit -m "test(jev-router): real-engine integration tests and CI on Linux and Windows" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
+- [ ] **Step 3b: Version-bump guard (U16)**
+
+`plugins/jev-router/test/version-bump.test.js`
+```js
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { needsBump } = require('../../../scripts/check-version-bump');
+
+test('no shipped files changed → ok', () => {
+  assert.equal(needsBump({ changed: ['README.md', 'plugins/jev-router/test/x.test.js', 'plugins/jev-router/README.md'], headVersion: '0.1.0', baseVersion: '0.1.0' }).ok, true);
+});
+
+test('shipped file changed without a bump → fails with a clear message', () => {
+  const r = needsBump({ changed: ['plugins/jev-router/lib/policy.js'], headVersion: '0.1.0', baseVersion: '0.1.0' });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /Bump "version" in plugins\/jev-router\/\.claude-plugin\/plugin\.json/);
+});
+
+test('skills and agents count as shipped; a bump passes; a new plugin passes', () => {
+  assert.equal(needsBump({ changed: ['plugins/jev-router/skills/setup/SKILL.md'], headVersion: '0.1.0', baseVersion: '0.1.0' }).ok, false);
+  assert.equal(needsBump({ changed: ['plugins/jev-router/lib/policy.js'], headVersion: '0.1.1', baseVersion: '0.1.0' }).ok, true);
+  assert.equal(needsBump({ changed: ['plugins/jev-router/lib/policy.js'], headVersion: '0.1.0', baseVersion: null }).ok, true);
+});
+```
+
+`scripts/check-version-bump.js`
+```js
+#!/usr/bin/env node
+'use strict';
+// Fails a PR that changes shipped plugin files without bumping plugin.json "version":
+// Claude Code only delivers an update to users when that string changes.
+const fs = require('fs');
+const { execSync } = require('child_process');
+
+const MANIFEST = 'plugins/jev-router/.claude-plugin/plugin.json';
+
+function isShipped(file) {
+  return file.startsWith('plugins/jev-router/')
+    && !file.startsWith('plugins/jev-router/test/')
+    && !/\/README\.md$/.test(file);
+}
+
+function needsBump({ changed, headVersion, baseVersion }) {
+  const shipped = changed.filter(isShipped);
+  if (!shipped.length) return { ok: true, message: 'no shipped plugin files changed' };
+  if (baseVersion === null) return { ok: true, message: 'plugin is new on this branch' };
+  if (headVersion === baseVersion) {
+    return { ok: false, message: `${shipped.length} shipped file(s) changed but the version is still ${headVersion}. Bump "version" in ${MANIFEST} and add a CHANGELOG.md entry.` };
+  }
+  return { ok: true, message: `version ${baseVersion} → ${headVersion}` };
+}
+
+if (require.main === module) {
+  const base = process.argv[2] || 'origin/main';
+  const changed = execSync(`git diff --name-only ${base}...HEAD`, { encoding: 'utf8' }).split('\n').filter(Boolean);
+  const headVersion = JSON.parse(fs.readFileSync(MANIFEST, 'utf8')).version;
+  let baseVersion = null;
+  try { baseVersion = JSON.parse(execSync(`git show ${base}:${MANIFEST}`, { encoding: 'utf8' })).version; } catch { baseVersion = null; }
+  const r = needsBump({ changed, headVersion, baseVersion });
+  (r.ok ? console.log : console.error)(r.message);
+  process.exit(r.ok ? 0 : 1);
+}
+
+module.exports = { needsBump, isShipped };
+```
+
+`CHANGELOG.md`
+```markdown
+# Changelog
+
+## jev-router 0.1.0 — unreleased
+- First release: local JEV-style prompt routing, deny-once tool guard, `/jev-router:setup` (full or lite), `/jev-router:doctor`.
+```
+
+Run: `npm test` → the version-bump tests pass.
+
+- [ ] **Step 4: Commit** → `git add -A && git commit -m "test(jev-router): real-engine integration tests; CI on Linux, Windows and macOS; version-bump guard" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`
 
 ---
 
 ### Task 13: End-to-end verification, docs, PR
 
 **Files:**
-- Create: `plugins/jev-router/README.md`
-- Modify: `README.md` (install instructions); `plugins/jev-router/.claude-plugin/plugin.json`, `lib/config.js` and the affected tests (`trim_output_lines` default, only if Step 3 confirms the shape); spec §7 (trim status)
+- Create: `plugins/jev-router/README.md`, `scripts/bench-hooks.js`, `THIRD_PARTY_NOTICES.md`, `SECURITY.md`
+- Modify: `README.md` (install instructions); `plugins/jev-router/.claude-plugin/plugin.json`, `lib/config.js` and the affected tests (`trim_output_lines` default, only if Step 3 confirms the shape); spec §7 (trim status); `CHANGELOG.md`
 
 - [ ] **Step 1: Install from the repo path into a throwaway config**
 
@@ -3279,9 +3920,76 @@ Expected:
 
 Otherwise leave it at `0` and write the observed shape in spec §7. Re-run `npm test`.
 
+- [ ] **Step 3c: Latency budget on a real machine (U15)**
+
+`scripts/bench-hooks.js`
+```js
+#!/usr/bin/env node
+'use strict';
+// Dev tool: real hook wall-clock time (process spawn + engine load) on this machine.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const data = path.resolve(process.argv[2] || '.engine-test');
+const scripts = path.join(__dirname, '..', 'plugins', 'jev-router', 'scripts');
+const env = { ...process.env, CLAUDE_PLUGIN_DATA: data, JEV_BASE_URL: '' };
+const big = path.join(os.tmpdir(), 'jr-bench-big.txt');
+fs.writeFileSync(big, 'x\n'.repeat(5000));
+
+function time(script, input, n = 20) {
+  const t = [];
+  for (let i = 0; i < n; i++) {
+    const start = process.hrtime.bigint();
+    const r = spawnSync(process.execPath, [path.join(scripts, script)], { input: JSON.stringify({ ...input, session_id: `bench-${i}` }), env, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`${script} exited ${r.status}: ${r.stderr}`);
+    t.push(Number(process.hrtime.bigint() - start) / 1e6);
+  }
+  t.sort((a, b) => a - b);
+  return { p50: Math.round(t[Math.floor(n / 2)]), p95: Math.round(t[Math.min(n - 1, Math.floor(n * 0.95))]) };
+}
+
+const route = time('route-prompt.js', { prompt: 'where is the rate limiter implemented?', cwd: process.cwd() });
+const guard = time('guard-tool.js', { tool_name: 'Read', tool_input: { file_path: big }, cwd: process.cwd() });
+fs.rmSync(big, { force: true });
+const cpu = os.cpus()[0];
+console.log(JSON.stringify({ machine: `${cpu ? cpu.model : 'cpu'} · ${os.cpus().length} threads · ${Math.round(os.totalmem() / 2 ** 30)} GB · ${process.platform}`, route, guard }, null, 2));
+if (route.p95 > 1200 || guard.p95 > 200) {
+  console.error('Latency budget exceeded (route p95 ≤ 1200 ms, guard p95 ≤ 200 ms).');
+  process.exit(1);
+}
+```
+
+Run: `node scripts/bench-hooks.js .engine-test`
+Expected: exit 0. Record the JSON in the plugin README under "Performance" (machine line included).
+**If the route budget is exceeded:** profile with `node --cpu-prof plugins/jev-router/scripts/route-prompt.js < input.json`, then apply these in order and re-measure:
+1. skip the engine call when the heuristic has a lexical margin ≥ 3× and the prompt is under 80 characters;
+2. cache the ONNX-optimised model with `optimizedModelFilePath` under the data dir;
+3. drop `graphOptimizationLevel` to `'basic'`.
+
+Never raise the budget without writing the reason in the spec.
+
 - [ ] **Step 4: Docs**
 
-`plugins/jev-router/README.md` sections:
+`plugins/jev-router/README.md` sections (every troubleshooting entry: symptom → cause → one fix):
+- **Before you install**: Node.js 18+ must be on PATH (`node --version`); ~300 MB free disk for setup; platform table (full engine: Windows x64/arm64, Linux x64/arm64 with glibc, macOS Apple Silicon; everywhere else: lite mode).
+- **Staying up to date (U16)**: third-party marketplaces don't auto-update by default. Either `/plugin` → Marketplaces → claude-token-plugins → Enable auto-update, or run `claude plugin update jev-router@claude-token-plugins`. Then `/reload-plugins`.
+- **Turning it off (kill switch)**: `/plugin configure jev-router@claude-token-plugins` → mode `off` (or `guard-only`), or `/plugin disable jev-router@claude-token-plugins`.
+- **Uninstalling (U18)**: `/plugin uninstall …` also deletes the engine data dir by default (Claude Code removes `${CLAUDE_PLUGIN_DATA}` unless `--keep-data`); `/jev-router:setup --uninstall` removes only the engine.
+- **Offline, proxy and mirrors (U9)**: `--model-dir`, `HF_ENDPOINT`, `NODE_USE_ENV_PROXY=1`; checksums are always enforced.
+- **Lite mode (U8)**: what it is, when setup chooses it, and how to retry the full engine.
+- **Troubleshooting**:
+  - "Node.js not found": paste the exact hook-error notice recorded in Task 3b (U1);
+  - "setup blocked in-session": run the command printed by `/jev-router:doctor` in your own terminal (U17);
+  - "the guard blocked a read I wanted": Claude can repeat the call, and the guard stands down after 5 denials per session (U3);
+  - "reminder keeps appearing": at most once a day; run setup or set mode `guard-only`.
+- **Known limitations**:
+  - hints are advice Claude may ignore;
+  - the PowerShell tool isn't guarded yet, only Bash (U21);
+  - Bash parsing is quote-aware for arguments but not for `;`/`&&`/`|` inside quotes;
+  - hook decisions from several plugins are merged by Claude Code, and the merge order isn't documented (U5).
+- **Performance**: the Step 3c numbers with the machine line.
 - **What it does**: routing hints (example hint line), the guard rules table, and deny-once behaviour.
 - **Install**:
   - `/plugin marketplace add Aneesh-IncuBrix/CORTEX`
@@ -3300,12 +4008,25 @@ Otherwise leave it at `0` and write the observed shape in spec §7. Re-run `npm 
   - accuracy figures come from a 14-prompt golden set, not a benchmark;
   - quote-unaware Bash parsing.
 
-Root `README.md`: set the jev-router status to "Available", and add the three install commands and a link to the plugin README.
+Root `README.md`: set the jev-router status to "Available", and add the three install commands, the Node 18+ prerequisite, the auto-update tip, and a link to the plugin README.
+
+`THIRD_PARTY_NOTICES.md` (U20):
+- onnxruntime-node 1.30.0 (MIT, © Microsoft Corporation), installed by setup.
+- all-MiniLM-L6-v2: the ONNX conversion `Xenova/all-MiniLM-L6-v2` @ `751bff3` of `sentence-transformers/all-MiniLM-L6-v2` (Apache-2.0), downloaded by setup and not redistributed in this repo.
+- Include the Apache-2.0 attribution text and the model card link.
+
+`SECURITY.md`:
+- how to report a vulnerability (GitHub private advisory on the repo);
+- what's in scope (hooks, setup downloads, the data dir);
+- the privacy guarantees from spec §10.
+
+`CHANGELOG.md`: replace "unreleased" with the release date.
 
 - [ ] **Step 5: Full verification before pushing (universal rule §9)**
 
-Run: `npm test && npm run test:engine && claude plugin validate --strict plugins/jev-router && claude plugin validate --strict .`
+Run: `npm test && npm run test:engine && node scripts/bench-hooks.js .engine-test && claude plugin validate --strict plugins/jev-router && claude plugin validate --strict .`
 Expected: everything passes. Check `git status` for strays, and confirm `.engine-test/` is ignored.
+Walk the User-trouble register: every row U1–U21 must point to a passing test, a recorded Task 3b result, or a README section. List any row that doesn't in the PR description as a known gap.
 
 - [ ] **Step 6: Commit, push, open the PR, watch CI**
 

@@ -1,0 +1,62 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly: catch breakage from new Node / onnxruntime / Claude Code releases (U16)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Unit and hook tests
+        run: npm test
+      - name: Engine setup (run twice to prove idempotence)
+        run: |
+          node plugins/jev-router/scripts/setup.js --data .engine-test
+          node plugins/jev-router/scripts/setup.js --data .engine-test
+      - name: Engine integration tests
+        run: npm run test:engine
+        env:
+          JEV_ENGINE_DATA: .engine-test
+      - name: Doctor smoke test
+        run: node plugins/jev-router/scripts/doctor.js --data .engine-test
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate plugin and marketplace manifests
+        run: |
+          npx -y @anthropic-ai/claude-code plugin validate --strict plugins/jev-router
+          npx -y @anthropic-ai/claude-code plugin validate --strict .
+
+  version-bump:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Shipped plugin changes must bump the version (users only get updates when it changes)
+        run: node scripts/check-version-bump.js "origin/${{ github.base_ref }}"

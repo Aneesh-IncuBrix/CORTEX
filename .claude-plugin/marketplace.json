@@ -1,0 +1,17 @@
+{
+  "name": "claude-token-plugins",
+  "owner": {
+    "name": "Aneesh-IncuBrix"
+  },
+  "plugins": [
+    {
+      "name": "jev-router",
+      "source": "./plugins/jev-router",
+      "description": "Fully local, JEV-style prompt router and token guard for Claude Code"
+    }
+  ],
+  "metadata": {
+    "description": "Claude Code plugins that cut token and credit usage, fully local.",
+    "version": "0.1.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "claude-token-plugins",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Claude Code plugins that reduce token and credit usage",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node scripts/run-tests.js",
+    "test:engine": "node scripts/run-tests.js engine"
+  }
+}

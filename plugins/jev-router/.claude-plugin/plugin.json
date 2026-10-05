@@ -1,0 +1,31 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Routes each prompt to the cheapest capable subagent with a fully local JEV-style engine, and blocks token-heavy tool calls. No API key; nothing leaves your machine.",
+  "author": { "name": "Aneesh-IncuBrix" },
+  "repository": "https://github.com/Aneesh-IncuBrix/CORTEX",
+  "license": "MIT",
+  "keywords": ["tokens", "cost", "routing", "subagents", "local", "jev"],
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "advise (routing + guard), guard-only, or off",
+      "default": "advise"
+    },
+    "read_line_cap": {
+      "type": "number",
+      "title": "Read guard line cap",
+      "description": "Deny (once) a full Read of files longer than this many lines",
+      "default": 800,
+      "min": 50
+    },
+    "trim_output_lines": {
+      "type": "number",
+      "title": "Bash output trim threshold",
+      "description": "Trim Bash output longer than this many lines to head+tail; 0 disables",
+      "default": 0,
+      "min": 0
+    }
+  }
+}

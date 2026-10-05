@@ -1,0 +1,10 @@
+{
+  "name": "jev-router-engine",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned runtime for jev-router's local engine. Installed by /jev-router:setup into the plugin data dir, not at plugin install.",
+  "license": "MIT",
+  "dependencies": {
+    "onnxruntime-node": "1.30.0"
+  }
+}

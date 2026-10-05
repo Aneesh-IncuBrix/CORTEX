@@ -34,6 +34,11 @@ function countLines(file) {
   }
 }
 
+// Never touch network paths: opening \\host\share on Windows sends NTLM credentials to that host.
+function isNetworkPath(p) {
+  return /^(\\\\|\/\/)/.test(String(p).replace(/^["']|["']$/g, ''));
+}
+
 function resolvePath(p, cwd) {
   const clean = String(p).replace(/^["']|["']$/g, '');
   return path.isAbsolute(clean) ? clean : path.resolve(cwd || process.cwd(), clean);
@@ -42,7 +47,7 @@ function resolvePath(p, cwd) {
 function checkRead(input, ctx) {
   if (!input || typeof input.file_path !== 'string') return null;
   if (input.offset != null || input.limit != null) return null;
-  if (SKIP_EXT.has(path.extname(input.file_path).toLowerCase())) return null;
+  if (SKIP_EXT.has(path.extname(input.file_path).toLowerCase()) || isNetworkPath(input.file_path)) return null;
   const info = ctx.countLines(resolvePath(input.file_path, ctx.cwd));
   if (!info || info.binary || info.lines <= ctx.readLineCap) return null;
   const tokens = Math.round(info.bytes / 4).toLocaleString('en-US');
@@ -95,7 +100,7 @@ function checkStage(w, stageText, ctx) {
     if (installs && !QUIET.test(stageText)) return `${cmd} ${sub || 'install'} prints long progress output. Add --silent (or --loglevel=error).`;
   }
   if (cmd === 'cat') {
-    for (const a of args.filter(x => !x.startsWith('-'))) {
+    for (const a of args.filter(x => !x.startsWith('-') && !isNetworkPath(x))) {
       const info = ctx.countLines(resolvePath(a, ctx.cwd));
       if (info && !info.binary && info.lines > ctx.readLineCap) return `cat ${path.basename(a.replace(/["']/g, ''))} dumps ${info.lines}${info.truncated ? '+' : ''} lines. Use Read with offset/limit, or grep/head.`;
     }

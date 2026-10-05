@@ -49,7 +49,8 @@ function hookNeighbours(cfg) {
     let hooks;
     try { hooks = JSON.parse(fs.readFileSync(path.join(p.installPath, 'hooks', 'hooks.json'), 'utf8')).hooks || {}; } catch { continue; }
     const matches = (matcher, tool) => {
-      try { return new RegExp(`^(${matcher})$`).test(tool); } catch { return false; } // other plugins' matchers may be odd
+      // No RegExp from other plugins' input (ReDoS): compare the '|'-separated names literally.
+      return String(matcher).split('|').map(s => s.trim()).some(s => s === tool || s === '*' || s === '.*');
     };
     const touches = (event, tool) => (hooks[event] || []).some(h => !h.matcher || matches(h.matcher, tool));
     if (['Read', 'Bash', 'Grep'].some(t => touches('PreToolUse', t))) out.pre.push(p.plugin);

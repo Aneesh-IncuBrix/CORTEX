@@ -6,7 +6,9 @@ function toHint(d, { agentsByName }) {
   if (!d) return null;
   const parts = [];
   const confidentLevel = d.difficultyConf >= 0.5;
-  if (d.agent && d.agentConf >= 0.55) {
+  // Agent names come from installed files; only plain names may reach Claude's context.
+  const safeAgent = typeof d.agent === 'string' && /^[\w.:-]{1,64}$/.test(d.agent);
+  if (safeAgent && d.agentConf >= 0.55) {
     const a = agentsByName && agentsByName.get(d.agent);
     const model = a && a.model && a.model !== 'inherit' ? ` [${a.model}]` : '';
     parts.push(`delegate to subagent "${d.agent}"${model}`); // tool-neutral: the tool was renamed Task → Agent (U7)

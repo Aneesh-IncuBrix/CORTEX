@@ -12,6 +12,6 @@
   ],
   "metadata": {
     "description": "Claude Code plugins that cut token and credit usage, fully local.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   }
 }

@@ -4,6 +4,7 @@ const { readReady } = require('./manifest');
 const { VectorCache } = require('./vectors');
 const { choice, score, noul, dot } = require('./questions');
 const { isLoopbackUrl } = require('../config');
+const { loadLabels, knnDifficulty } = require('./knn');
 
 const LEVELS = [
   ['a greeting, thanks, ok, or an acknowledgement', 'thanks!', 'ok got it'],
@@ -23,7 +24,7 @@ function agentText(a) {
   return `${a.name.replace(/^[^:]+:/, '').replace(/[-_:]/g, ' ')}: ${a.description}`;
 }
 
-async function decideLocal({ prompt, agents, shortlisted, embedder, cache }) {
+async function decideLocal({ prompt, agents, shortlisted, embedder, cache, labels }) {
   const t0 = Date.now();
   let fresh = 0;
   const vec = async text => {
@@ -60,10 +61,10 @@ async function decideLocal({ prompt, agents, shortlisted, embedder, cache }) {
     criteria[k] = agentText(a);
   }
   const ag = await choice(vec, sv, criteria);
-  const df = await score(vec, sv, LEVELS);
+  const df = labels ? knnDifficulty(sv, labels) : await score(vec, sv, LEVELS);
   const vb = await noul(vec, sv, VERBOSE);
   return {
-    source: 'engine',
+    source: labels ? 'engine-knn' : 'engine',
     difficulty: df.level,
     difficultyDist: df.probabilities,
     difficultyConf: df.confidence,
@@ -142,7 +143,9 @@ async function decideRemote({ baseUrl, prompt, shortlisted, timeoutMs }) {
 function combine(engine, heur) {
   const dist = [0, 1, 2, 3].map(i => {
     const e = engine.difficultyDist ? engine.difficultyDist[i] : (i === engine.difficulty ? 1 : 0);
-    return 0.6 * e + 0.4 * (i === heur.difficulty ? 1 : 0);
+    // kNN learned from this user's history; the keyword heuristic only helps the untrained scorer.
+    const hw = engine.source === 'engine-knn' ? 0 : 0.4;
+    return (1 - hw) * e + hw * (i === heur.difficulty ? 1 : 0);
   });
   const lvl = dist.indexOf(Math.max(...dist));
   return { ...engine, difficulty: lvl, difficultyConf: dist[lvl], verbose: Boolean(heur.verbose || engine.verboseP >= 0.7) };
@@ -156,7 +159,7 @@ async function decide({ prompt, agents, shortlisted, cfg, useRemote, createEmbed
     const embedder = await make(cfg.dataDir);
     const cache = new VectorCache(path.join(cfg.dataDir, 'vectors.json'));
     try {
-      return await decideLocal({ prompt, agents, shortlisted, embedder, cache });
+      return await decideLocal({ prompt, agents, shortlisted, embedder, cache, labels: loadLabels(cfg.dataDir) });
     } finally {
       cache.save();
     }

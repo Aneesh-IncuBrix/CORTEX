@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // Measures cost per prompt in sessions where jev-router gave a hint vs sessions where it did not.
-// Usage: node savings-report.js [--data <plugin data dir>] [--projects <dir>] [--since 2026-10-01] [--json]
+// Usage: node savings-report.js [--data <plugin data dir>] [--projects <dir>] [--since 2026-10-01] [--budget <usd/month>] [--json]
 const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../lib/config');
@@ -73,18 +73,32 @@ function print(r) {
   else if (r.savingPct === null) console.log('\nNo routed sessions in range: enable the router and use it before reading a saving.');
   else console.log(`\nRouted sessions cost ${Math.abs(r.savingPct).toFixed(1)}% ${r.savingPct >= 0 ? 'less' : 'MORE'} per prompt than baseline.`);
   console.log('Caveat: sessions are not randomised; compare like-for-like periods (--since) before quoting a number.');
+  if (r.budget) {
+    const b = r.budget;
+    console.log(`\nBudget: $${b.spent.toFixed(2)} of $${b.limit.toFixed(2)} spent this month (${b.day}/${b.daysInMonth} days); projected $${b.projected.toFixed(2)} → ${b.projected > b.limit ? 'OVER budget: lower the default model/effort or route more to cheap subagents' : 'within budget'}.`);
+  }
+}
+
+// Month-to-date spend from all sessions, projected linearly to month end.
+function budgetStatus(projectsDir, dataDir, limit, now = new Date()) {
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+  const r = report({ projectsDir, dataDir, since: start });
+  const spent = r.arms.routed.cost + r.arms.baseline.cost;
+  const day = now.getUTCDate();
+  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+  return { limit, spent, day, daysInMonth, projected: (spent / day) * daysInMonth };
 }
 
 if (require.main === module) {
   const cfg = loadConfig();
   const argv = process.argv.slice(2);
-  const r = report({
-    projectsDir: arg(argv, '--projects') || path.join(cfg.configDir, 'projects'),
-    dataDir: arg(argv, '--data') || cfg.dataDir,
-    since: arg(argv, '--since'),
-  });
+  const projectsDir = arg(argv, '--projects') || path.join(cfg.configDir, 'projects');
+  const dataDir = arg(argv, '--data') || cfg.dataDir;
+  const r = report({ projectsDir, dataDir, since: arg(argv, '--since') });
+  const limit = Number(arg(argv, '--budget'));
+  if (limit > 0) r.budget = budgetStatus(projectsDir, dataDir, limit);
   if (argv.includes('--json')) console.log(JSON.stringify(r, null, 2));
   else print(r);
 }
 
-module.exports = { report };
+module.exports = { report, budgetStatus };

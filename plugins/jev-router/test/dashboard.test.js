@@ -53,6 +53,15 @@ test('collect counts every billed response once: subagents, no-prompt calls, res
   assert.equal(Math.round(d.phases.before.cost * 100), 353);
 });
 
+test('dashboard shows a valid calibration and ignores a tampered one', () => {
+  const dir = tmpDir();
+  const opts = { projectsDir: path.join(dir, 'none'), dataDir: dir, days: 30, now: new Date('2026-10-13T00:00:00Z') };
+  write(path.join(dir, 'calibration.json'), JSON.stringify({ source: 'bedrock', from: '2026-09-14', to: '2026-10-14', estimated: 100, billed: 83, factor: 0.83 }));
+  assert.deepEqual(collect(opts).calibration, { source: 'bedrock', from: '2026-09-14', to: '2026-10-14', estimated: 100, billed: 83, factor: 0.83 });
+  write(path.join(dir, 'calibration.json'), JSON.stringify({ source: '<script>', from: 'x', to: 'y', billed: 1 }));
+  assert.equal(collect(opts).calibration, null);
+});
+
 test('verdict refuses to claim a saving on little data, and flags a quality drop', () => {
   const p = (prompts, cost, corrections) => ({ prompts, cost, corrections, pushback: corrections / prompts, perAccepted: cost / (prompts - corrections) });
   assert.equal(verdict({ before: p(200, 200, 2), routed: p(20, 5, 0), holdout: p(0, 0, 0) }).ready, false);

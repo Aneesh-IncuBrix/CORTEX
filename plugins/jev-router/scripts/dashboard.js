@@ -98,7 +98,18 @@ function collect({ projectsDir, dataDir, days, now = new Date() }) {
   const series = Object.entries(daily)
     .map(([key, v]) => ({ day: key.split('|')[0], phase: key.split('|')[1], ...finish(v) }))
     .sort((a, b) => a.day.localeCompare(b.day));
-  return { generatedAt: now.toISOString(), days, install, phases, series, verdict: verdict(phases) };
+  return { generatedAt: now.toISOString(), days, install, phases, series, verdict: verdict(phases), calibration: readCalibration(dataDir) };
+}
+
+// Written by reconcile-cost.js; numbers only, sanitised because they reach the page.
+function readCalibration(dataDir) {
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(dataDir, 'calibration.json'), 'utf8'));
+    if (!['anthropic', 'bedrock'].includes(c.source) || !/^\d{4}-\d{2}-\d{2}$/.test(c.from) || !/^\d{4}-\d{2}-\d{2}$/.test(c.to)) return null;
+    return { source: c.source, from: c.from, to: c.to, estimated: Number(c.estimated) || 0, billed: Number(c.billed) || 0, factor: Number(c.factor) || null };
+  } catch {
+    return null;
+  }
 }
 
 function html(data) {
@@ -123,6 +134,7 @@ footer{color:var(--muted);font-size:13px}
 </style></head><body><main>
 <h1>Token savings</h1><p class="sub" id="sub"></p>
 <div class="verdict" id="verdict"></div>
+<p class="sub" id="cal"></p>
 <div class="grid" id="kpis"></div>
 <div class="chart"><h2 class="small" style="margin:0 0 6px">Cost per prompt by day</h2><div class="legend" id="legend"></div><div id="bars"></div></div>
 <div class="card" style="margin-bottom:20px"><h2>All groups</h2><div class="tw"><table id="tbl"></table></div></div>
@@ -135,6 +147,7 @@ const $=n=>'$'+n.toFixed(n<1?3:2), k=n=>n>=1e6?(n/1e6).toFixed(1)+'M':Math.round
 const ref=D.phases[D.verdict.ref], r=D.phases.routed, name={before:'Before plugin',routed:'With plugin',holdout:'Holdout (no hints)',off:'Plugin off'};
 document.getElementById('sub').textContent='Last '+D.days+' days · plugin first active '+(D.install?D.install.slice(0,10):'not yet')+' · generated '+D.generatedAt.slice(0,16).replace('T',' ')+' UTC';
 const v=document.getElementById('verdict');v.textContent=D.verdict.text;
+const C=D.calibration;document.getElementById('cal').textContent=C?'Real bill ('+(C.source==='bedrock'?'AWS Bedrock':'Anthropic')+', '+C.from+' to '+C.to+'): $'+C.billed.toFixed(2)+' billed vs $'+C.estimated.toFixed(2)+' list-price estimate'+(C.factor?' (×'+C.factor.toFixed(2)+'). Dollar figures below are list-price estimates; multiply by '+C.factor.toFixed(2)+' for your real rate.':'.'):'Dollar figures are list-price estimates. Run /jev-router:reconcile with billing access to compare with your real bill.';
 if(D.verdict.ready)v.style.borderLeftColor=D.verdict.saving>=0&&D.verdict.qualityPts<=1?'var(--good)':'var(--bad)';
 function kpi(title,a,b,fmt){const has=a&&r.prompts;const d=has?(b-a)/a:0;
 return '<div class="card"><h2>'+title+'</h2><div class="vs"><div><div class="small">'+name[D.verdict.ref]+'</div><div class="big">'+fmt(a)+'</div></div><div><div class="small">With plugin</div><div class="big">'+(r.prompts?fmt(b):'—')+'</div></div></div>'+(has?'<div class="delta '+(!D.verdict.ready?'small':d<=0?'good':'bad')+'">'+(D.verdict.ready?'':'early: ')+(d>=0?'+':'')+(d*100).toFixed(1)+'%</div>':'')+'</div>'}

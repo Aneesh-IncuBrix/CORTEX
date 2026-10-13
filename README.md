@@ -20,6 +20,7 @@ Design specs: [`docs/superpowers/specs/`](docs/superpowers/specs/).
 | `/jev-router:setup` | One-time local engine install (routing is off until this runs). |
 | `/jev-router:optimize` | Scans your codebase for every LLM call (Anthropic, OpenAI, Gemini, Bedrock, Vertex, Mistral, Cohere, Groq, Ollama, LiteLLM, LangChain, OpenRouter…), detects routers you already use (OmniRoute, claude-code-router, LiteLLM, `ANTHROPIC_BASE_URL`), asks which models to keep or reduce and your monthly budget, then proposes caps, caching, thinking/effort limits, batching and model changes for you to approve. Reads env var names only, never key values. |
 | `/jev-router:dashboard` | Local HTML dashboard: cost and tokens per prompt before vs after the plugin and vs the random holdout, pushback rate, and cost per accepted answer (so cheaper-but-worse never looks like a saving). |
+| `/jev-router:reconcile` | Compares the list-price estimate with your real bill per day: Anthropic Admin API cost report (`ANTHROPIC_ADMIN_KEY`, admin key only) or AWS Cost Explorer for Bedrock (`ce:GetCostAndUsage`). Read-only; the key is never printed or stored. The dashboard then shows the real bill and the correction factor. |
 | `/jev-router:doctor` | Engine health and recent routing decisions. |
 
 Scripts you can run directly (Node 18+, no dependencies):

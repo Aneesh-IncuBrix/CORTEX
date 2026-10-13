@@ -6,7 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { loadConfig } = require('../lib/config');
-const { listTranscripts, readTurns } = require('../lib/transcripts');
+const { listTranscripts, readTurns, costRows } = require('../lib/transcripts');
+const { oldestFirst } = require('./savings-report');
 const { readArms } = require('../lib/experiment');
 const { readTail } = require('../lib/log');
 
@@ -67,18 +68,29 @@ function collect({ projectsDir, dataDir, days, now = new Date() }) {
   const arms = readArms(dataDir);
   const phases = { before: blank(), routed: blank(), holdout: blank(), off: blank() };
   const daily = {};
-  for (const f of listTranscripts(projectsDir)) {
-    if (f.includes(SUB)) continue;
-    for (const t of readTurns(f)) {
-      if (!ISO.test(t.ts || '') || t.ts < since) continue; // only well-formed dates reach the page's HTML
-      const phase = !install || t.ts < install ? 'before' : arms.get(t.session) || 'off';
-      const key = `${t.ts.slice(0, 10)}|${phase}`;
-      daily[key] = daily[key] || blank();
-      for (const target of [phases[phase], daily[key]]) {
-        target.prompts++;
-        target.cost += t.cost;
-        target.tokens += t.tokens;
-        if (t.corrected) target.corrections++;
+  const seenResponses = new Set();
+  const seenPrompts = new Set();
+  // Every billed response counts once (main thread, subagents, compaction); prompts and pushback come from typed turns.
+  const bucket = (ts, session) => {
+    if (!ISO.test(ts || '') || ts < since) return null; // only well-formed dates reach the page's HTML
+    const phase = !install || ts < install ? 'before' : arms.get(session) || 'off';
+    const key = `${ts.slice(0, 10)}|${phase}`;
+    daily[key] = daily[key] || blank();
+    return [phases[phase], daily[key]];
+  };
+  for (const f of oldestFirst(listTranscripts(projectsDir))) {
+    if (!f.includes(SUB)) {
+      for (const t of readTurns(f, seenPrompts)) {
+        for (const target of bucket(t.ts, t.session) || []) {
+          target.prompts++;
+          if (t.corrected) target.corrections++;
+        }
+      }
+    }
+    for (const r of costRows(f, seenResponses)) {
+      for (const target of bucket(r.ts, r.session) || []) {
+        target.cost += r.cost;
+        target.tokens += r.tokens;
       }
     }
   }
@@ -114,7 +126,7 @@ footer{color:var(--muted);font-size:13px}
 <div class="grid" id="kpis"></div>
 <div class="chart"><h2 class="small" style="margin:0 0 6px">Cost per prompt by day</h2><div class="legend" id="legend"></div><div id="bars"></div></div>
 <div class="card" style="margin-bottom:20px"><h2>All groups</h2><div class="tw"><table id="tbl"></table></div></div>
-<footer>List prices for first-party API usage; subscription or proxy-routed usage is billed differently. Main-thread cost only (subagent work is in the savings report). "Pushback" means your next prompt said the answer was wrong; "cost per accepted answer" spreads the cost over answers you did not push back on, so cheaper-but-worse does not look like a saving. Holdout = sessions randomly given no hints, the fair comparison.</footer>
+<footer>List prices for first-party API usage; subscription or proxy-routed usage is billed differently. Cost covers every billed Claude Code response: main conversation, subagents, compaction and web searches, each counted once even when a resumed session repeats it. It does not include model calls your own application makes (see /jev-router:optimize for those). "Pushback" means your next prompt said the answer was wrong; "cost per accepted answer" spreads the cost over answers you did not push back on, so cheaper-but-worse does not look like a saving. Holdout = sessions randomly given no hints, the fair comparison.</footer>
 </main>
 <script type="application/json" id="data">${json}</script>
 <script>

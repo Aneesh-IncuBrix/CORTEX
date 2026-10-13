@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../lib/config');
-const { listTranscripts, readTurns, fileCost } = require('../lib/transcripts');
+const { listTranscripts, readTurns, costRows } = require('../lib/transcripts');
 const { readArms } = require('../lib/experiment');
 
 const MIN_PROMPTS = 100;
@@ -27,6 +27,11 @@ function sessionArms(dataDir) {
   return arms;
 }
 
+function oldestFirst(files) {
+  const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
+  return files.map(f => [mtime(f), f]).sort((a, b) => a[0] - b[0]).map(x => x[1]);
+}
+
 function blank() { return { sessions: 0, prompts: 0, corrections: 0, cost: 0, byModel: {} }; }
 function add(a, model, c) {
   const fam = (String(model).match(/fable|opus|sonnet|haiku/) || ['other'])[0];
@@ -37,25 +42,24 @@ function add(a, model, c) {
 function report({ projectsDir, dataDir, since }) {
   const known = sessionArms(dataDir);
   const arms = { routed: blank(), holdout: blank(), baseline: blank() };
-  const sessionArm = new Map();
-  const files = listTranscripts(projectsDir);
-  // Main transcripts first so every session has an arm before its subagent files are counted.
-  for (const f of files.filter(f => !f.includes(SUB))) {
-    const turns = readTurns(f).filter(t => !since || (t.ts || '') >= since);
-    if (!turns.length) continue;
-    const arm = known.get(turns[0].session) || 'baseline';
-    sessionArm.set(turns[0].session, arm);
-    const a = arms[arm];
-    a.sessions++;
-    a.prompts += turns.length;
-    a.corrections += turns.filter(t => t.corrected).length;
-    for (const t of turns) for (const [m, c] of Object.entries(t.byModel)) add(a, m, c);
-  }
-  for (const f of files.filter(f => f.includes(SUB))) {
-    const { session, byModel, ts } = fileCost(f);
-    if (since && (ts || '') < since) continue;
-    const arm = sessionArm.get(session);
-    if (arm) for (const [m, c] of Object.entries(byModel)) add(arms[arm], m, c);
+  const armOfSession = s => known.get(s) || 'baseline';
+  const inRange = ts => !since || (ts || '') >= since;
+  const seenResponses = new Set();
+  const seenPrompts = new Set();
+  const sessions = new Set();
+  // Oldest file first, so a resumed session's copied history is owned by the session that produced it.
+  for (const f of oldestFirst(listTranscripts(projectsDir))) {
+    if (!f.includes(SUB)) {
+      for (const t of readTurns(f, seenPrompts)) {
+        if (!inRange(t.ts)) continue;
+        const a = arms[armOfSession(t.session)];
+        if (!sessions.has(t.session)) { sessions.add(t.session); a.sessions++; }
+        a.prompts++;
+        if (t.corrected) a.corrections++;
+      }
+    }
+    // Cost: every billed response once, main thread and subagents, including calls with no typed prompt.
+    for (const r of costRows(f, seenResponses)) if (inRange(r.ts)) add(arms[armOfSession(r.session)], r.model, r.cost);
   }
   for (const a of Object.values(arms)) {
     a.perPrompt = a.prompts ? a.cost / a.prompts : 0;
@@ -116,4 +120,4 @@ if (require.main === module) {
   else print(r);
 }
 
-module.exports = { report, budgetStatus };
+module.exports = { report, budgetStatus, oldestFirst };

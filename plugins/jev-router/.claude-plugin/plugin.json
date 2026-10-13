@@ -1,6 +1,6 @@
 {
   "name": "jev-router",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Routes each prompt to the cheapest capable subagent with a fully local JEV-style engine, and blocks token-heavy tool calls. No API key; nothing leaves your machine.",
   "author": { "name": "Aneesh-IncuBrix" },
   "repository": "https://github.com/Aneesh-IncuBrix/CORTEX",

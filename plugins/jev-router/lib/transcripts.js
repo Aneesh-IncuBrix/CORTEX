@@ -23,9 +23,13 @@ function usageCost(model, u) {
   const c = u.cache_creation || {};
   const w1h = c.ephemeral_1h_input_tokens || 0;
   const w5m = c.ephemeral_5m_input_tokens ?? Math.max(0, (u.cache_creation_input_tokens || 0) - w1h);
+  const searches = (u.server_tool_use && u.server_tool_use.web_search_requests) || 0;
   return ((u.input_tokens || 0) * inp + (u.output_tokens || 0) * out + (u.cache_read_input_tokens || 0) * read
-    + w5m * inp * 1.25 + w1h * inp * 2) / 1e6;
+    + w5m * inp * 1.25 + w1h * inp * 2) / 1e6
+    + searches * WEB_SEARCH_USD; // billed per search, on top of tokens
 }
+
+const WEB_SEARCH_USD = 0.01; // $10 per 1,000 searches (Anthropic list price)
 
 function listTranscripts(root) {
   const out = [];
@@ -104,13 +108,20 @@ function* responses(rows) {
 }
 
 // Main-thread turns: one per typed prompt, with cost, output tokens and tool calls until the next prompt.
-function readTurns(file) {
+// Pass a shared `seenPrompts` set to count a prompt once when resumed sessions repeat it in a new file.
+function readTurns(file, seenPrompts = null) {
   const turns = [];
   let cur = null;
   const rows = readLines(file);
   const idx = new Map(rows.map((r, i) => [r, i]));
   const starts = [];
-  rows.forEach((r, i) => { const p = promptText(r); if (p) starts.push([i, { session: r.sessionId, ts: r.timestamp, prompt: p, cost: 0, tokens: 0, outTokens: 0, tools: 0, byModel: {} }]); });
+  rows.forEach((r, i) => {
+    const p = promptText(r);
+    if (!p) return;
+    const dup = Boolean(seenPrompts && r.uuid && seenPrompts.has(r.uuid));
+    if (seenPrompts && r.uuid) seenPrompts.add(r.uuid);
+    starts.push([i, { session: r.sessionId, ts: r.timestamp, prompt: p, cost: 0, tokens: 0, outTokens: 0, tools: 0, byModel: {}, dup }]);
+  });
   let s = 0;
   for (const { row, m, first } of responses(rows)) {
     const i = idx.get(row);
@@ -131,11 +142,37 @@ function readTurns(file) {
     cur.tokens += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
   }
   while (s < starts.length) { markCorrection(turns, starts[s][1]); turns.push(starts[s++][1]); }
-  return turns;
+  return turns.filter(t => !t.dup);
 }
 
 function markCorrection(turns, next) {
   if (turns.length && CORRECTION.test(next.prompt)) turns[turns.length - 1].corrected = true;
+}
+
+// Every billed response in a file that has not been seen in another file: main thread, subagents,
+// compaction and other calls with no typed prompt. Resumed sessions copy history into a new file,
+// so `seen` must be shared across all files of one scan.
+function costRows(file, seen) {
+  const rows = [];
+  let session = null;
+  let lastTs = null; // a response without its own timestamp belongs to the moment of the row before it
+  for (const r of readLines(file)) {
+    session = r.sessionId || session;
+    lastTs = r.timestamp || lastTs;
+    const m = r.message;
+    if (r.type !== 'assistant' || !m || !m.usage) continue;
+    const id = m.id || r.requestId;
+    if (id) { if (seen.has(id)) continue; seen.add(id); }
+    const u = m.usage;
+    rows.push({
+      session: r.sessionId || session,
+      ts: lastTs,
+      model: m.model,
+      cost: usageCost(m.model, u),
+      tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0),
+    });
+  }
+  return rows;
 }
 
 // Whole-file cost by model (used for subagent transcripts and session totals).
@@ -151,4 +188,4 @@ function fileCost(file) {
   return { session, ts, byModel };
 }
 
-module.exports = { usageCost, listTranscripts, promptText, readTurns, fileCost, lastContextTokens, priceOf };
+module.exports = { usageCost, listTranscripts, promptText, readTurns, fileCost, costRows, lastContextTokens, priceOf };

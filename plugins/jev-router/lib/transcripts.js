@@ -110,7 +110,7 @@ function readTurns(file) {
   const rows = readLines(file);
   const idx = new Map(rows.map((r, i) => [r, i]));
   const starts = [];
-  rows.forEach((r, i) => { const p = promptText(r); if (p) starts.push([i, { session: r.sessionId, ts: r.timestamp, prompt: p, cost: 0, outTokens: 0, tools: 0, byModel: {} }]); });
+  rows.forEach((r, i) => { const p = promptText(r); if (p) starts.push([i, { session: r.sessionId, ts: r.timestamp, prompt: p, cost: 0, tokens: 0, outTokens: 0, tools: 0, byModel: {} }]); });
   let s = 0;
   for (const { row, m, first } of responses(rows)) {
     const i = idx.get(row);
@@ -127,6 +127,8 @@ function readTurns(file) {
     cur.cost += c;
     cur.byModel[m.model] = (cur.byModel[m.model] || 0) + c;
     cur.outTokens += m.usage.output_tokens || 0;
+    const u = m.usage;
+    cur.tokens += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
   }
   while (s < starts.length) { markCorrection(turns, starts[s][1]); turns.push(starts[s++][1]); }
   return turns;

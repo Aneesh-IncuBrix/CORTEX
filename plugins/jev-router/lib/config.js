@@ -16,6 +16,8 @@ function loadConfig(env = process.env) {
     mode: MODES.includes(env.CLAUDE_PLUGIN_OPTION_MODE) ? env.CLAUDE_PLUGIN_OPTION_MODE : 'advise',
     readLineCap: Math.max(50, num(env.CLAUDE_PLUGIN_OPTION_READ_LINE_CAP, 800)),
     trimOutputLines: Math.max(0, num(env.CLAUDE_PLUGIN_OPTION_TRIM_OUTPUT_LINES, 0)),
+    ctxWarnTokens: Math.max(0, num(env.CLAUDE_PLUGIN_OPTION_CTX_WARN_TOKENS, 150000)),
+    holdoutPercent: Math.min(50, Math.max(0, num(env.CLAUDE_PLUGIN_OPTION_HOLDOUT_PERCENT, 10))),
     configDir,
     dataDir: env.CLAUDE_PLUGIN_DATA || path.join(configDir, 'plugins', 'data', 'jev-router-local'),
     jevBaseUrl: env.JEV_BASE_URL || '',

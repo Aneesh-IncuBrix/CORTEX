@@ -29,6 +29,12 @@ node plugins/jev-router/scripts/savings-report.js --budget 300        # Claude C
 node plugins/jev-router/scripts/build-labels.js                       # teach difficulty routing from your own history
 ```
 
+How jev-router proves and improves itself:
+
+- **Context warning:** when a session's context passes 150k tokens (setting `ctx_warn_tokens`), it suggests `/compact` or a fresh session, once per further 50k.
+- **Holdout:** 10% of sessions (setting `holdout_percent`) get no hints at all. `savings-report.js` compares hinted sessions with this random control group, so the saving is measured, not assumed.
+- **Pushback as quality signal:** a prompt like "no, that's wrong" marks the previous turn as a miss. The report shows the pushback rate per group, and `build-labels.js` learns that such prompts were harder than they looked.
+
 Savings figures use first-party list prices and are estimates. If you route through another provider, your real prices differ.
 
 Install instructions will be added once the first plugin is published.

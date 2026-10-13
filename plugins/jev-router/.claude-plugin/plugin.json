@@ -1,6 +1,6 @@
 {
   "name": "jev-router",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Routes each prompt to the cheapest capable subagent with a fully local JEV-style engine, and blocks token-heavy tool calls. No API key; nothing leaves your machine.",
   "author": { "name": "Aneesh-IncuBrix" },
   "repository": "https://github.com/Aneesh-IncuBrix/CORTEX",
@@ -19,6 +19,21 @@
       "description": "Deny (once) a full Read of files longer than this many lines",
       "default": 800,
       "min": 50
+    },
+    "ctx_warn_tokens": {
+      "type": "number",
+      "title": "Context size warning",
+      "description": "Warn when a session's context passes this many tokens (it is re-sent with every prompt), then every further 50k; 0 disables",
+      "default": 150000,
+      "min": 0
+    },
+    "holdout_percent": {
+      "type": "number",
+      "title": "Holdout sessions (%)",
+      "description": "Share of sessions that get no hints, so savings and quality can be measured fairly; 0 disables",
+      "default": 10,
+      "min": 0,
+      "max": 50
     },
     "trim_output_lines": {
       "type": "number",

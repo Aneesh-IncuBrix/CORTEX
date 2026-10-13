@@ -112,13 +112,13 @@ async function main() {
   const dups = [...new Set(cat.duplicates)];
   out.push(`agents: ${cat.agents.length} (${counts})${dups.length ? ` · duplicates skipped: ${dups.join(', ')}` : ''}`);
 
-  const decisions = readTail(path.join(dataDir, 'decisions.jsonl'), 10);
+  const decisions = readTail(path.join(dataDir, 'decisions.jsonl'), 30).filter(d => d.source).slice(-10); // skip context-warning rows
   out.push(`last ${decisions.length} decisions:`);
   for (const d of decisions) {
     out.push(`  ${d.ts} ${d.source} diff=${d.difficulty} (${d.conf}) agent=${d.agent || '-'} (${d.agentConf}) hint=${d.hintChars}c ${d.latencyMs}ms${d.error ? ` error=${d.error}` : ''}`);
   }
 
-  const recent = readTail(path.join(dataDir, 'decisions.jsonl'), 200).filter(d => d.source === 'engine').map(d => d.latencyMs);
+  const recent = readTail(path.join(dataDir, 'decisions.jsonl'), 200).filter(d => String(d.source).startsWith('engine')).map(d => d.latencyMs);
   if (recent.length) out.push(`engine latency (last ${recent.length}): p50 ${percentile(recent, 0.5)} ms, p95 ${percentile(recent, 0.95)} ms`);
 
   const guard = readTail(path.join(dataDir, 'guard.jsonl'), 500);

@@ -62,6 +62,34 @@ function promptText(row) {
   return t || null;
 }
 
+// The user pushing back on the previous answer: the outcome signal that the last turn fell short.
+const CORRECTION = /^(no\b|nope|wrong|incorrect|that'?s (not|wrong)|not what i|(it )?(doesn'?t|didn'?t|still (doesn'?t|isn'?t|not)) work|still (broken|failing|wrong)|try again|revert|undo|you (broke|missed|forgot))/i;
+
+// Context the next request re-sends: input + cache read + cache write of the last main-thread response.
+// Reads only the file tail so the hook stays fast on long sessions.
+function lastContextTokens(file, tailBytes = 262144) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, tailBytes);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let r;
+      try { r = JSON.parse(lines[i]); } catch { continue; }
+      const u = r.type === 'assistant' && !r.isSidechain && r.message && r.message.usage;
+      if (u) return { model: r.message.model, tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) };
+    }
+    return { model: null, tokens: 0 };
+  } catch {
+    return { model: null, tokens: 0 };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 // Assistant rows repeat usage on every content block of one response: count each response once.
 function* responses(rows) {
   const seen = new Set();
@@ -86,7 +114,7 @@ function readTurns(file) {
   let s = 0;
   for (const { row, m, first } of responses(rows)) {
     const i = idx.get(row);
-    while (s < starts.length && starts[s][0] < i) { cur = starts[s][1]; turns.push(cur); s++; }
+    while (s < starts.length && starts[s][0] < i) { cur = starts[s][1]; markCorrection(turns, cur); turns.push(cur); s++; }
     if (!cur || row.isSidechain) continue;
     for (const b of m.content || []) {
       if (b.type !== 'tool_use') continue;
@@ -100,8 +128,12 @@ function readTurns(file) {
     cur.byModel[m.model] = (cur.byModel[m.model] || 0) + c;
     cur.outTokens += m.usage.output_tokens || 0;
   }
-  while (s < starts.length) turns.push(starts[s++][1]);
+  while (s < starts.length) { markCorrection(turns, starts[s][1]); turns.push(starts[s++][1]); }
   return turns;
+}
+
+function markCorrection(turns, next) {
+  if (turns.length && CORRECTION.test(next.prompt)) turns[turns.length - 1].corrected = true;
 }
 
 // Whole-file cost by model (used for subagent transcripts and session totals).
@@ -117,4 +149,4 @@ function fileCost(file) {
   return { session, ts, byModel };
 }
 
-module.exports = { usageCost, listTranscripts, promptText, readTurns, fileCost };
+module.exports = { usageCost, listTranscripts, promptText, readTurns, fileCost, lastContextTokens, priceOf };

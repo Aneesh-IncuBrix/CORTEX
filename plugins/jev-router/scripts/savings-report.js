@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { loadConfig } = require('../lib/config');
 const { listTranscripts, readTurns, fileCost } = require('../lib/transcripts');
+const { readArms } = require('../lib/experiment');
 
 const MIN_PROMPTS = 100;
 const SUB =`${path.sep}subagents${path.sep}`;
@@ -15,17 +16,18 @@ function arg(argv, name) {
   return i >= 0 ? argv[i + 1] : null;
 }
 
-function hintedSessions(dataDir) {
-  const s = new Set();
+// Session → arm. arms.jsonl is authoritative; sessions from before it existed fall back to "got a hint".
+function sessionArms(dataDir) {
+  const arms = readArms(dataDir);
   let raw = '';
-  try { raw = fs.readFileSync(path.join(dataDir, 'decisions.jsonl'), 'utf8'); } catch { return s; }
+  try { raw = fs.readFileSync(path.join(dataDir, 'decisions.jsonl'), 'utf8'); } catch { return arms; }
   for (const line of raw.split('\n')) {
-    try { const d = JSON.parse(line); if (d.hintChars > 0 && d.session) s.add(d.session); } catch { /* skip */ }
+    try { const d = JSON.parse(line); if (d.hintChars > 0 && d.session && !arms.has(d.session)) arms.set(d.session, 'routed'); } catch { /* skip */ }
   }
-  return s;
+  return arms;
 }
 
-function blank() { return { sessions: 0, prompts: 0, cost: 0, byModel: {} }; }
+function blank() { return { sessions: 0, prompts: 0, corrections: 0, cost: 0, byModel: {} }; }
 function add(a, model, c) {
   const fam = (String(model).match(/fable|opus|sonnet|haiku/) || ['other'])[0];
   a.cost += c;
@@ -33,19 +35,20 @@ function add(a, model, c) {
 }
 
 function report({ projectsDir, dataDir, since }) {
-  const hinted = hintedSessions(dataDir);
-  const arms = { routed: blank(), baseline: blank() };
+  const known = sessionArms(dataDir);
+  const arms = { routed: blank(), holdout: blank(), baseline: blank() };
   const sessionArm = new Map();
   const files = listTranscripts(projectsDir);
   // Main transcripts first so every session has an arm before its subagent files are counted.
   for (const f of files.filter(f => !f.includes(SUB))) {
     const turns = readTurns(f).filter(t => !since || (t.ts || '') >= since);
     if (!turns.length) continue;
-    const arm = hinted.has(turns[0].session) ? 'routed' : 'baseline';
+    const arm = known.get(turns[0].session) || 'baseline';
     sessionArm.set(turns[0].session, arm);
     const a = arms[arm];
     a.sessions++;
     a.prompts += turns.length;
+    a.corrections += turns.filter(t => t.corrected).length;
     for (const t of turns) for (const [m, c] of Object.entries(t.byModel)) add(a, m, c);
   }
   for (const f of files.filter(f => f.includes(SUB))) {
@@ -57,22 +60,28 @@ function report({ projectsDir, dataDir, since }) {
   for (const a of Object.values(arms)) {
     a.perPrompt = a.prompts ? a.cost / a.prompts : 0;
     a.cheapShare = a.cost ? (a.byModel.haiku || 0) / a.cost : 0;
+    a.correctionRate = a.prompts ? a.corrections / a.prompts : 0;
   }
-  const b = arms.baseline.perPrompt;
-  const savingPct = b && arms.routed.prompts ? (1 - arms.routed.perPrompt / b) * 100 : null;
-  return { since: since || null, hintedSessions: hinted.size, arms, savingPct };
+  // Holdout is the fair comparison (same plugin, same period, random sessions); baseline only as a fallback.
+  const controlled = arms.holdout.prompts >= MIN_PROMPTS;
+  const ref = controlled ? arms.holdout : arms.baseline;
+  const savingPct = ref.perPrompt && arms.routed.prompts ? (1 - arms.routed.perPrompt / ref.perPrompt) * 100 : null;
+  return { since: since || null, arms, controlled, savingPct, qualityDelta: arms.routed.correctionRate - ref.correctionRate };
 }
 
 function print(r) {
-  const row = (n, a) => `${n.padEnd(9)} ${String(a.sessions).padStart(8)} ${String(a.prompts).padStart(8)} ${('$' + a.cost.toFixed(2)).padStart(11)} ${('$' + a.perPrompt.toFixed(3)).padStart(10)} ${(a.cheapShare * 100).toFixed(1).padStart(6)}%`;
+  const row = (n, a) => `${n.padEnd(9)} ${String(a.sessions).padStart(8)} ${String(a.prompts).padStart(8)} ${('$' + a.cost.toFixed(2)).padStart(11)} ${('$' + a.perPrompt.toFixed(3)).padStart(10)} ${(a.cheapShare * 100).toFixed(1).padStart(6)}% ${(a.correctionRate * 100).toFixed(1).padStart(7)}%`;
   console.log(`jev-router savings report${r.since ? ` since ${r.since}` : ''} (first-party list prices)`);
-  console.log('arm       sessions  prompts        cost   $/prompt  haiku$');
-  console.log(row('routed', r.arms.routed));
-  console.log(row('baseline', r.arms.baseline));
+  console.log('arm       sessions  prompts        cost   $/prompt  haiku$  pushback');
+  for (const n of ['routed', 'holdout', 'baseline']) console.log(row(n, r.arms[n]));
+  const vs = r.controlled ? 'the random holdout' : 'baseline (not randomised)';
   if (r.savingPct !== null && r.arms.routed.prompts < MIN_PROMPTS) console.log(`\nToo little routed data (${r.arms.routed.prompts} prompts, need ${MIN_PROMPTS}): no saving can be claimed yet.`);
   else if (r.savingPct === null) console.log('\nNo routed sessions in range: enable the router and use it before reading a saving.');
-  else console.log(`\nRouted sessions cost ${Math.abs(r.savingPct).toFixed(1)}% ${r.savingPct >= 0 ? 'less' : 'MORE'} per prompt than baseline.`);
-  console.log('Caveat: sessions are not randomised; compare like-for-like periods (--since) before quoting a number.');
+  else {
+    console.log(`\nRouted sessions cost ${Math.abs(r.savingPct).toFixed(1)}% ${r.savingPct >= 0 ? 'less' : 'MORE'} per prompt than ${vs}.`);
+    console.log(`Quality: user pushback is ${Math.abs(r.qualityDelta * 100).toFixed(1)} points ${r.qualityDelta > 0 ? 'HIGHER' : 'lower or equal'} in routed sessions.`);
+  }
+  if (!r.controlled) console.log(`Caveat: holdout has ${r.arms.holdout.prompts} prompts; the comparison is randomised once it reaches ${MIN_PROMPTS}.`);
   if (r.budget) {
     const b = r.budget;
     console.log(`\nBudget: $${b.spent.toFixed(2)} of $${b.limit.toFixed(2)} spent this month (${b.day}/${b.daysInMonth} days); projected $${b.projected.toFixed(2)} → ${b.projected > b.limit ? 'OVER budget: lower the default model/effort or route more to cheap subagents' : 'within budget'}.`);
@@ -87,7 +96,7 @@ function monthStart(now) {
 // Pass the main report when it already covers exactly this month, so logs are read once.
 function budgetStatus(projectsDir, dataDir, limit, now = new Date(), monthReport = null) {
   const r = monthReport || report({ projectsDir, dataDir, since: monthStart(now) });
-  const spent = r.arms.routed.cost + r.arms.baseline.cost;
+  const spent = Object.values(r.arms).reduce((s, a) => s + a.cost, 0);
   const day = now.getUTCDate();
   const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
   return { limit, spent, day, daysInMonth, projected: (spent / day) * daysInMonth };

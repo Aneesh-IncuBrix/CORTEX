@@ -16,9 +16,8 @@ const { LEVELS } = require('../lib/engine');
 // ponytail: fixed thresholds from one user's history; revisit if label counts are badly skewed.
 function labelOf(t) {
   if (t.delegated) return 3;
-  if (t.tools <= 2 && t.outTokens < 1500) return 1;
-  if (t.tools > 20 || t.outTokens > 20000) return 3;
-  return 2;
+  const base = t.tools <= 2 && t.outTokens < 1500 ? 1 : t.tools > 20 || t.outTokens > 20000 ? 3 : 2;
+  return t.corrected ? Math.min(3, base + 1) : base; // the user had to push back: it was harder than it looked
 }
 
 function arg(argv, name, dflt) {

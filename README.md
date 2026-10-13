@@ -13,6 +13,24 @@ Anthropic as usual.
 
 Design specs: [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
+## jev-router commands
+
+| Command | What it does |
+|---|---|
+| `/jev-router:setup` | One-time local engine install (routing is off until this runs). |
+| `/jev-router:optimize` | Scans your codebase for every LLM call (Anthropic, OpenAI, Gemini, Bedrock, Vertex, Mistral, Cohere, Groq, Ollama, LiteLLM, LangChain, OpenRouter…), detects routers you already use (OmniRoute, claude-code-router, LiteLLM, `ANTHROPIC_BASE_URL`), asks which models to keep or reduce and your monthly budget, then proposes caps, caching, thinking/effort limits, batching and model changes for you to approve. Reads env var names only, never key values. |
+| `/jev-router:doctor` | Engine health and recent routing decisions. |
+
+Scripts you can run directly (Node 18+, no dependencies):
+
+```bash
+node plugins/jev-router/scripts/scan-llm.js <repo> [--json]          # where tokens are spent in code
+node plugins/jev-router/scripts/savings-report.js --budget 300        # Claude Code $/prompt, routed vs not, month-end projection
+node plugins/jev-router/scripts/build-labels.js                       # teach difficulty routing from your own history
+```
+
+Savings figures use first-party list prices and are estimates. If you route through another provider, your real prices differ.
+
 Install instructions will be added once the first plugin is published.
 
 License: MIT

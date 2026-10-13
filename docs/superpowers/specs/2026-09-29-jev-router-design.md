@@ -1,266 +1,251 @@
 # jev-router — Design Spec
 
-Date: 2026-09-29 · Status: awaiting review · Repo: `claude-token-plugins` (marketplace) → `plugins/jev-router`
+Date: 2026-09-29 (rev 2: fully local engine) · Status: approved · Repo: `claude-token-plugins` → `plugins/jev-router`
 
 ## 1. Goal
 
-Reduce Claude Code credit usage by putting TypeSafe's **JEV** System-One decision model in front of
-Claude as a cheap, fast triage layer. JEV (≈$42 per billion input tokens, output free, 70–500 ms)
-answers typed questions about each prompt; the plugin turns the answers into small, actionable
-guidance and blocks the most common token-wasting tool calls.
+Reduce Claude Code credit usage with a fast, **fully local** "System One" decision layer in the style of
+TypeSafe's JEV. It answers typed questions (`choice` / `score` / `noul`) about each prompt. The plugin turns
+the answers into small routing hints and blocks the most common token-wasting tool calls.
 
 Success criteria:
 
-1. Installs with two commands from a Git repo; works for anyone with Node ≥ 18.
-2. Works **without** a JEV key (local heuristic fallback) and never blocks the user.
-3. Adds ≤ 80 tokens of context per prompt, and **zero** when it has nothing useful to say.
-4. Routes to *all* subagents the user really has: built-ins, user agents, project agents, and agents
+1. Installs from a Git repo; the engine installs with one command (`/jev-router:setup`).
+2. **Nothing leaves the device.** After setup there are no network calls. Setup itself only downloads pinned,
+   checksummed artefacts; no user data is sent.
+3. No API key and no account.
+4. Adds ≤ 80 tokens of context per prompt, and **zero** when it has nothing useful to say.
+5. Routes to *all* subagents the user really has: built-ins, user agents, project agents, and agents
    shipped by enabled plugins.
-5. Every behaviour is covered by automated tests, plus a real headless `claude --plugin-dir` run.
+6. Never blocks the user. Any failure means no hint.
+7. Every behaviour has automated tests, plus a real headless `claude --plugin-dir` run.
 
-## 2. Platform facts this design relies on (verified 2026-09-29)
+## 2. Why a local embedding engine (spike, 2026-09-29, Win11 laptop, 14.8 GB RAM, no GPU)
+
+| Engine | Result |
+|---|---|
+| TypeSafe hosted JEV | Cloud-only (no weights), so it violates "nothing leaves the device". Rejected |
+| jeff (JEV-compatible, GLiFormer, PyTorch) | **Blocked by Windows Smart App Control** (unsigned torch DLL, WinError 4551); listens on 0.0.0.0 by default. Rejected |
+| Ollama + qwen3.5 0.8B (logprob decisions) | 6.3 s per prompt, unusable accuracy. Rejected |
+| **all-MiniLM-L6-v2 (q8, 23 MB) on onnxruntime-node** | **4.7 ms per prompt once loaded, ~1.0 s per cold hook process**; Microsoft-signed binaries pass Smart App Control; 12/12 confident agent picks correct in a 20-prompt sanity set. **Chosen** |
+
+The engine is described as *JEV-style*. It is not JEV and makes no claim of JEV's accuracy.
+
+## 3. Platform facts relied on (verified 2026-09-29)
 
 | Fact | Source |
 |---|---|
-| `UserPromptSubmit` can add `hookSpecificOutput.additionalContext`; cannot replace the prompt or change the model | code.claude.com/docs/en/hooks |
-| `PreToolUse` can return `permissionDecision: "deny"` + `permissionDecisionReason` (shown to Claude) | same |
-| `PostToolUse` can return `hookSpecificOutput.updatedToolOutput` to replace a tool result | same |
-| Hook `timeout` is in **seconds**; `UserPromptSubmit` default 30 s | same |
-| `${CLAUDE_PLUGIN_ROOT}` (install dir), `${CLAUDE_PLUGIN_DATA}` (persistent dir) | same |
-| `userConfig` in `plugin.json`; values reach hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`; `sensitive` values go to the OS secure store | plugins/manifest-reference |
-| Plugin agents are namespaced `<plugin>:<name>` | plugins/components |
-| `claude --plugin-dir <path>` loads a local plugin; `claude plugin validate <path>` checks it | plugins/cli-reference |
-| JEV: `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer`, body `{model, state, questions}`; question types `noul`/`choice`/`score`; errors 401/422/429/529 | docs.typesafe.ai/api |
+| `UserPromptSubmit` → `hookSpecificOutput.additionalContext`; cannot replace the prompt or change the model | code.claude.com/docs/en/hooks |
+| `PreToolUse` → `permissionDecision: "deny"` + `permissionDecisionReason` (shown to Claude) | same |
+| `PostToolUse` → `hookSpecificOutput.updatedToolOutput` replaces the tool result | same |
+| Common JSON output `systemMessage` is shown to the **user** (costs Claude no context) | same |
+| Hook `timeout` is in seconds; `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}` | same |
+| Plugin agents are namespaced `<plugin>:<name>`; `userConfig` → `CLAUDE_PLUGIN_OPTION_<KEY>` | plugins docs |
+| `claude --plugin-dir`, `claude plugin validate` | plugins/cli-reference |
+| `onnxruntime-node@1.30.0` bundles win32/linux/darwin binaries; its `postinstall` downloads extras, so it is installed with `--ignore-scripts` | npm registry metadata |
 
-A hook **cannot switch the model**. Rejected alternative: an `ANTHROPIC_BASE_URL` proxy that
-rewrites `model` per request. Switching models mid-conversation invalidates the prompt cache, and
-that usually costs more than it saves.
-
-## 3. Repository layout
+## 4. Repository layout
 
 ```
 claude-token-plugins/
-├── .claude-plugin/marketplace.json      # marketplace "claude-token-plugins", lists jev-router
+├── .claude-plugin/marketplace.json          # marketplace "claude-token-plugins"
+├── .github/workflows/ci.yml                 # tests on ubuntu + windows, plugin validate
 ├── README.md  LICENSE (MIT)
 └── plugins/jev-router/
-    ├── .claude-plugin/plugin.json       # name, version, userConfig
+    ├── .claude-plugin/plugin.json           # name, version, userConfig
     ├── hooks/hooks.json
-    ├── scripts/                         # hook entrypoints (thin: parse stdin → lib → stdout)
-    │   ├── route-prompt.js              # UserPromptSubmit
-    │   ├── guard-tool.js                # PreToolUse  (Read|Bash|Grep)
-    │   ├── trim-output.js               # PostToolUse (Bash)
-    │   └── doctor.js                    # used by /jev-router:doctor
+    ├── engine/package.json, package-lock.json   # pinned engine deps (installed by setup, not at plugin install)
+    ├── scripts/
+    │   ├── route-prompt.js    # UserPromptSubmit
+    │   ├── guard-tool.js      # PreToolUse (Read|Bash|Grep)
+    │   ├── trim-output.js     # PostToolUse (Bash)
+    │   ├── session-start.js   # SessionStart: setup reminder (hard gate)
+    │   ├── setup.js           # /jev-router:setup
+    │   └── doctor.js          # /jev-router:doctor
     ├── lib/
-    │   ├── hookio.js      # read stdin JSON, write output, fail-open wrapper
-    │   ├── config.js      # userConfig/env → typed config
-    │   ├── jev.js         # JEV HTTP client
-    │   ├── catalog.js     # subagent discovery + cache
-    │   ├── shortlist.js   # BM25 ranking of agents vs prompt
-    │   ├── heuristics.js  # local fallback decision
-    │   ├── policy.js      # decision → hint text (or null)
-    │   ├── guard-rules.js # tool-call rules
-    │   ├── ledger.js      # per-session deny-once memory
-    │   └── log.js         # capped decisions.jsonl
-    ├── agents/quick.md  agents/scout.md   # model: haiku
-    ├── commands/doctor.md
+    │   ├── hookio.js  config.js  log.js  ledger.js
+    │   ├── catalog.js  shortlist.js  heuristics.js  policy.js  guard-rules.js
+    │   └── engine/
+    │       ├── index.js       # decide(): engine → Decision; loopback-only remote option
+    │       ├── local.js       # ONNX session, mean pooling, normalise
+    │       ├── questions.js   # typed questions: choice / score / noul
+    │       ├── wordpiece.js   # zero-dep BERT WordPiece tokenizer (reads tokenizer.json)
+    │       ├── vectors.js     # label-vector cache (vectors.json, base64 Float32)
+    │       └── manifest.js    # pinned model revision + sha256, engine paths
+    ├── agents/quick.md  agents/scout.md
+    ├── skills/setup/SKILL.md  skills/doctor/SKILL.md   # skills supersede commands/ in current Claude Code
     └── test/ (node:test) + test/fixtures/
 ```
 
-Runtime: Node ≥ 18 (global `fetch`), CommonJS, **zero dependencies**. Hook commands are
-`node "${CLAUDE_PLUGIN_ROOT}/scripts/<x>.js"`, which works in bash, PowerShell and cmd.
+Plugin code: Node ≥ 18, CommonJS, **zero runtime dependencies**. The engine's only dependency,
+`onnxruntime-node`, lives in `${CLAUDE_PLUGIN_DATA}/engine`, is installed by setup, and is loaded with a
+dynamic `require` from that path. Hook commands are `node "${CLAUDE_PLUGIN_ROOT}/scripts/<x>.js"`.
 
-## 4. Configuration (`userConfig`)
+## 5. Configuration (`userConfig`)
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `jev_api_key` | string, sensitive, optional | — | TypeSafe key. Also read from env `JEV_API_KEY` / `TYPESAFE_API_KEY` |
 | `mode` | string: `advise` \| `guard-only` \| `off` | `advise` | `guard-only` disables prompt routing |
 | `read_line_cap` | number | 800 | Read guard threshold (lines) |
-| `trim_output_lines` | number | 600 | Bash output trim threshold; `0` disables trimming |
+| `trim_output_lines` | number | 600 | Bash output trim threshold; `0` disables |
 
-Key handling: the key is entered through the plugin's config prompt (stored in the OS keychain) or set
-as an env var. It is never written to plugin files, logs or `decisions.jsonl`. The doctor shows only the
-last 4 characters. Users must not paste keys into chat, because transcripts are stored on disk.
+Env-only: `JEV_BASE_URL` (optional). If set, it must resolve to `127.0.0.1`, `::1` or `localhost`, and it is
+used as a JEV-wire-compatible local server instead of the built-in engine. **Any non-loopback URL is
+refused** and logged. `CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
-Env-only (for testing and advanced use): `JEV_BASE_URL` (default `https://api.typesafe.ai`),
-`JEV_TIMEOUT_MS` (default 2500), `CLAUDE_CONFIG_DIR` (default `~/.claude`).
+## 6. Local engine
 
-## 5. Component contracts
+### 6.1 Setup (`/jev-router:setup` → `scripts/setup.js`)
+1. Print what will happen: roughly 100 MB of downloads (the `onnxruntime-node` package and a 23 MB model)
+   into `${CLAUDE_PLUGIN_DATA}/engine`, with no data uploaded.
+2. Copy `engine/package.json` and `package-lock.json` into the data dir, then run
+   `npm ci --ignore-scripts --no-audit --no-fund --omit=dev`. The lockfile carries integrity hashes.
+3. Delete `onnxruntime-node/bin/**` entries for other OS/arch combinations to save space. The host's own
+   binaries are kept.
+4. Download `Xenova/all-MiniLM-L6-v2` at **revision `751bff37182d3f1213fa05d7196b954e230abad9`**:
+   `onnx/model_quantized.onnx` (sha256 `afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1`)
+   and `tokenizer.json` (sha256 pinned in `manifest.js` when implemented). Each is written to a temp file,
+   hash-checked, then renamed. A mismatch deletes the file and aborts.
+5. Self-test: load the model, embed 3 fixed strings, and check the vector dimension (384) and the expected
+   similarity ordering. Write `engine/READY.json` = `{version, revision, installedAt, platform}`.
+6. The script is idempotent: a re-run verifies and repairs. `--uninstall` deletes `engine/`.
 
-### 5.1 `catalog.js`: `loadCatalog({configDir, projectDir, dataDir}) → Agent[]`
-`Agent = {name, description, model, source: "builtin"|"user"|"project"|"plugin"}`
+### 6.2 Hard gate
+- `session-start.js`: if `mode=advise` and `READY.json` is missing or invalid, emit
+  `{"systemMessage": "jev-router: routing is off until you run /jev-router:setup (local engine, ~100 MB, one-time)."}`.
+  It is shown to the user only, costs no Claude tokens, and appears once per session.
+- `route-prompt.js`: engine not ready → no output. The tool guard and trim work regardless of setup.
+- Runtime failure after setup (corrupt model, load error, or over time budget) → heuristic decision for that
+  prompt (fail-open). Recorded as `source: "heuristic-fallback"` so the doctor shows it.
 
-Sources:
-1. **Built-ins**: `general-purpose` (inherit), `Explore` (haiku), `Plan` (inherit), with short fixed descriptions.
-2. **User**: `<configDir>/agents/**/*.md`.
-3. **Project**: `<projectDir>/.claude/agents/**/*.md`.
-4. **Plugins**: read `<configDir>/plugins/installed_plugins.json` (v2: `plugins[id][] = {scope, installPath, projectPath?}`).
-   Keep ids enabled in `enabledPlugins` merged from `<configDir>/settings.json` →
-   `<projectDir>/.claude/settings.json` → `settings.local.json` (later wins, `false` disables).
-   Pick the entry whose scope applies (a `project`/`local` entry only if its `projectPath` equals `projectDir`,
-   else the `user` entry). Agents directory = `plugin.json` `agents` field (string or array) if present,
-   else `<installPath>/agents`. Name = `<pluginName>:<frontmatter name or file stem>`.
+### 6.3 Typed questions (`local.js`)
+Everything runs on normalised mean-pooled embeddings with cosine similarity. `T` is the softmax temperature.
+- `choice(state, criteria{key: description})`: softmax over `sim(state, "key: description")`, T = 0.05 →
+  `{choice, probabilities, confidence}`.
+- `score(state, levels[])`: each level has a prototype text plus 2–3 fixed exemplar phrases; its similarity is
+  the max over them; softmax with T = 0.05 → `{score: Σ i·pᵢ, probabilities, confidence: max pᵢ}`.
+- `noul(state, {true, false})`: softmax over the two descriptions with T = 0.05 → `{noul: p(true)}`.
+- Label vectors are cached in `${CLAUDE_PLUGIN_DATA}/vectors.json` (base64 Float32, keyed by sha1 of the
+  label text, atomic rename on save, capped at 3,000 entries), so agents are embedded only once. Setup
+  pre-computes vectors for the whole catalog.
+- Candidate pool = the top 12 agents by cosine similarity plus the BM25 shortlist, so agents with no
+  lexical overlap can still be chosen.
+- Inputs are truncated to 256 WordPiece tokens. ONNX session options: 1 intra-op thread and graph
+  optimisation enabled.
 
-This scans exactly one install per plugin, so there are no stale cached versions and no `docs/*/agents`
-translations. Frontmatter parser: single-line `key: value`, quoted values, and `|`/`>` block scalars.
-Descriptions have `<example>` blocks and newlines stripped and are cut to 240 characters.
-Unreadable or malformed files are skipped. **Cache**: `<dataDir>/catalog.json`, keyed by the mtimes of
-every scanned directory plus the settings and installed-plugins files; rebuilt only when that key changes.
+### 6.4 `engine/index.js`: `decide({prompt, candidates, cfg}) → Decision | null`
+Questions: `difficulty` (score, 4 levels), `agent` (choice over `main` plus the shortlist), and `verbose`
+(noul). `Decision = {source: "engine"|"remote", difficulty 0..3, difficultyConf, agent|null, agentConf, verbose, latencyMs}`.
+The whole call has a 2,500 ms budget, then it returns `null` and the caller uses the heuristic.
 
-### 5.2 `shortlist.js`: `shortlist(agents, prompt, k=12) → Agent[]`
-BM25 over `name + description`: lowercase, split on non-alphanumerics, drop stop-words, and strip light
-suffixes (`s`, `es`, `ing`, `ed`). Each result carries its `score`. `Explore`, `jev-router:scout` and
-`jev-router:quick` are always included. This keeps the JEV `choice` question small (limit 255 options)
-and more accurate.
+### 6.5 Hybrid with heuristics
+The final difficulty combines the engine distribution (weight 0.6) with the heuristic's one-hot level
+(weight 0.4). `verbose` = heuristic regex match **or** engine `noul ≥ 0.7`. `agent` comes from the engine only.
 
-### 5.3 `jev.js`: `decide({apiKey, baseUrl, timeoutMs, prompt, candidates}) → Decision | null`
-One request with three parallel questions:
+## 7. Other components (unchanged from rev 1 unless noted)
 
-```json
-{
-  "model": "jev-latest",
-  "state": { "request": "<prompt, first 4000 chars>" },
-  "questions": {
-    "difficulty": { "type": "score",
-      "instructions": "How much reasoning and work does this coding-assistant request need?",
-      "criteria": [
-        "Trivial: greeting, acknowledgement, or a one-fact answer",
-        "Simple: a lookup, search, or small single-file edit",
-        "Moderate: a multi-step change across a few files, or debugging with clear leads",
-        "Hard: architecture, ambiguous debugging, or large multi-file work" ] },
-    "agent": { "type": "choice",
-      "instructions": "Which specialist should do the bulk of this request? Choose main if the main conversation should handle it directly.",
-      "criteria": { "main": "The main assistant handles it directly", "a1": "<agent 1 description>", "...": "..." } },
-    "verbose": { "type": "noul",
-      "instructions": "Does the user explicitly ask for a detailed explanation, walkthrough, or teaching?" }
-  }
-}
-```
+- **`catalog.js`**: sources are built-ins, `<configDir>/agents/**`, `<project>/.claude/agents/**`, and enabled
+  plugins resolved through `installed_plugins.json` + `enabledPlugins` (user → project → local, later wins).
+  Scope-aware entry choice, `plugin.json` custom `agents` path, names `<plugin>:<name>`, a frontmatter parser
+  that handles block scalars, `<example>` stripping, 240-character descriptions, and a cache keyed on mtimes.
+- **`shortlist.js`**: BM25 top 12, always including `Explore`, `jev-router:scout` and `jev-router:quick`.
+- **`heuristics.js`**: difficulty and verbose signals; agent = the top BM25 result with a ≥ 1.5× margin; confidences 0.6.
+- **`policy.js`**: decision → one hint line of at most 300 characters, or `null`.
+  - No hint for slash commands, prompts under 4 characters, or acknowledgements.
+  - Delegate when `agentConf ≥ 0.55`.
+  - Scout suggestion when difficulty ≤ 1 and there is no agent.
+  - "Answer tersely" when difficulty ≤ 1 and verbose is not wanted.
+  - Difficulty 3 → no extra advice.
+  - All confidences < 0.5 → `null`.
+- **`guard-rules.js` + `ledger.js`**: the Read, Bash and Grep rules from rev 1. Deny once, then allow the
+  identical repeat through the normal permission flow. The guard **never returns `allow`**.
+- **`trim-output.js`**: head 150 + marker + tail 100 once a result exceeds `trim_output_lines`. Enabled by
+  default only after the headless run confirms the Bash `updatedToolOutput` shape; otherwise it ships with `0`.
+- **`log.js`**: `decisions.jsonl` capped at 500 lines. It stores a sha1 prefix of the prompt, never the text.
+- **`hookio.js`**: fail-open wrapper with hard timers (routing 7 s, guard and trim 4 s, session-start 3 s).
+  Errors go to `errors.log`.
 
-Choice keys are opaque (`a1..aN`) and mapped back to agent names, so names containing `:` never reach JEV.
-`Decision = {source: "jev", difficulty: 0..3, difficultyConf, agent: name|null, agentConf, verbose: bool, latencyMs}`.
-Difficulty level = the index with the highest probability when `probabilities` is present; otherwise it is
-derived from `score` (treated as already on the 0..3 index scale if > 1, else scaled by 3). The parser
-tolerates both shapes and is tested against each. Requests time out through `AbortController`
-(`timeoutMs`). A 429/529 gets one retry after 250 ms if time remains. Any other failure returns `null`
-and records an error class (`auth`, `invalid`, `rate`, `overload`, `timeout`, `network`, `parse`).
-
-### 5.4 `heuristics.js`: `decide({prompt, candidates}) → Decision` (`source: "heuristic"`)
-- **Difficulty**: starts from prompt length; **up** for signals such as architect, design, refactor, migrate,
-  why, debug, investigate, or more than 2 file paths; **down** for what is, where, find, list, rename,
-  typo, thanks.
-- **Agent**: the top shortlist agent if its BM25 score is at least 1.5× the runner-up's and above a
-  floor; otherwise `null`.
-- **Verbose**: matches explain, walk me through, teach, in detail, or step by step.
-- Confidences are fixed at 0.6 so the policy can tell a heuristic decision from a JEV one.
-
-### 5.5 `policy.js`: `toHint(decision, {agentsByName}) → string | null`
-Default rules (tunable; this is where the savings strategy lives):
-- Prompt is a slash command, under 4 characters, or a pure acknowledgement → `null` (checked before the JEV call).
-- `agent` set and `agentConf ≥ 0.55` → `delegate: Task(subagent_type="<agent>")` plus the agent's model.
-- Difficulty ≤ 1 with no agent → `delegate file search/reading to jev-router:scout (haiku)`.
-- `verbose=false` and difficulty ≤ 1 → `answer tersely`.
-- Difficulty 3 → nothing extra (hard work belongs to the main model).
-- Nothing applies, or every confidence is < 0.5 → `null`.
-- Output format is one line capped at 300 characters, e.g.
-  `[jev-router] simple (0.82) · delegate: Task(subagent_type="Explore") [haiku] · answer tersely`.
-
-### 5.6 `guard-rules.js`: `evaluate(toolName, toolInput, ctx) → {deny: reason} | null`
-- **Read**: no `offset`/`limit`; the file exists and has more than `read_line_cap` lines (lines counted over
-  the first 8 MB); the extension is not an image, PDF or ipynb.
-  Reason: `<file> has N lines (~T tokens). Grep for the section, then Read with offset/limit.`
-- **Bash** (checked per command segment split on `&&`, `;` and `|`; a later `| head`, `| tail`, `| grep`,
-  `> file` or `| wc` counts as already bounded):
-  - `npm|pnpm|yarn install|i|ci|add` without a quiet flag
-  - `cat <file>` above the line cap
-  - `git log` without `-n`, `-<num>`, `--max-count` or `--oneline`
-  - `find` without `-maxdepth`
-  - `ls -R`
-  - `docker logs` without `--tail`
-  - `journalctl` without `-n`
-
-  Each reason names the cheaper form.
-- **Grep**: `output_mode: "content"` with `head_limit: 0`.
-- Every reason ends with: `Re-issue the identical call to proceed anyway.`
-
-### 5.7 `ledger.js`: deny once, allow on repeat
-Key = sha1(tool_name + canonical JSON(tool_input)), stored in
-`<dataDir>/ledger/<session_id>.json`. On first match the call is denied and recorded; an identical repeat
-in the same session produces no output, so the call goes through the **normal permission flow**. The
-guard **never returns `allow`**, because that would bypass the user's own permission rules. Ledger files
-older than 48 hours are pruned on write.
-
-### 5.8 `trim-output.js`: PostToolUse (Bash)
-If the Bash result text is longer than `trim_output_lines` lines, return `updatedToolOutput` with the first
-150 lines, a marker (`… [jev-router trimmed N lines; re-run with grep/head/tail to see them] …`), and the
-last 100 lines. The result's structure is kept (only text fields are rewritten). **Gate:** the exact
-`tool_response` / `updatedToolOutput` shape for Bash is confirmed in the headless integration run before this
-hook is enabled by default. If it can't be confirmed, the hook is shipped disabled (`trim_output_lines: 0`)
-and the README says so.
-
-### 5.9 `log.js`
-Appends `{ts, session, source, difficulty, agent, conf, hintChars, latencyMs, error?}` to
-`<dataDir>/decisions.jsonl` and trims it to the newest 500 lines once it passes 600.
-**Prompt text is never logged**; only its length and a sha1 prefix are.
-
-### 5.10 `hookio.js`: fail-open wrapper
-Each entrypoint runs `main()` inside try/catch, with a hard timer (7 s for routing, 4 s for guard and trim)
-that forces a silent `exit 0`. Errors are written to `<dataDir>/errors.log` and never to stdout. A failure
-therefore means *no hint* or *no guard*, and never a blocked prompt or tool.
-
-## 6. Hook wiring
+## 8. Hook wiring
 
 | Event | Matcher | Script | timeout (s) |
 |---|---|---|---|
+| SessionStart | `startup\|resume\|clear` | session-start.js | 5 |
 | UserPromptSubmit | — | route-prompt.js | 8 |
 | PreToolUse | `Read\|Bash\|Grep` | guard-tool.js | 5 |
 | PostToolUse | `Bash` | trim-output.js | 5 |
 
-`mode=off` makes every script a no-op. `mode=guard-only` makes route-prompt a no-op.
+## 9. Commands and agents
 
-## 7. Agents and command
+- `/jev-router:setup`: runs `setup.js` (6.1). `/jev-router:setup --uninstall` removes the engine.
+- `/jev-router:doctor`: reports:
+  - Node version and mode,
+  - engine status (READY.json, revision, file hashes re-verified, 3-string self-test latency),
+  - `JEV_BASE_URL` status (loopback check),
+  - catalog counts by source, plus any duplicates,
+  - the last 10 decisions (source, difficulty, agent, confidence, latency),
+  - counts of guard denies and trims.
+- `jev-router:quick` (haiku): small edits and lookups. `jev-router:scout` (haiku, read-only): search and summaries.
 
-- `jev-router:quick` (haiku; tools Read, Edit, Write, Grep, Glob, Bash) handles small, well-specified
-  edits and one-fact lookups. It returns a brief summary.
-- `jev-router:scout` (haiku; tools Read, Grep, Glob) does read-only search and summaries. It returns
-  paths, line numbers and a short summary, never whole files.
-- `/jev-router:doctor` runs `doctor.js`, which reports:
-  - Node version, mode, and key present (masked),
-  - a live JEV ping (one tiny request, clearly labelled), with the error class if it fails,
-  - catalog counts by source, plus any duplicate names,
-  - the last 10 decisions, and the counts of guard denies and trims.
+## 10. Privacy guarantees (enforced and tested)
 
-## 8. Error handling summary
+1. No hosted endpoint exists in the code. `JEV_BASE_URL` must be loopback, which a unit test covers.
+2. After setup, a test runs the engine with `fetch` and `http(s).request` monkey-patched to throw. Routing must
+   still succeed.
+3. Logs never contain prompt text. The doctor output prints no content, only counts and hashes.
+4. What leaves the device: nothing from the plugin. Claude Code itself sends conversations, including any hint
+   the plugin adds, to Anthropic as usual. The README states this plainly.
 
-| Failure | Behaviour |
-|---|---|
-| No key / 401 | heuristic fallback; the doctor shows why |
-| 429/529 | one retry, then heuristic |
-| JEV slow | abort at `JEV_TIMEOUT_MS`, then heuristic |
-| Catalog error | proceed with built-ins only |
-| Any exception or hook timer | silent exit 0, logged to errors.log |
-
-## 9. Testing
+## 11. Testing
 
 - **Unit** (`node --test`):
-  - catalog: fixture config dir containing enabled and disabled plugins, stale cached versions,
-    translation folders, a plugin.json custom agents path, project-scope entries and malformed frontmatter,
-  - shortlist ranking, heuristics, policy (table-driven),
-  - guard rules (positive and negative case for every rule, including bounded pipes),
-  - ledger (deny, then allow on repeat, isolated per session, pruning),
-  - jev parser (both score shapes, choice-key mapping), jev client error classes (mock fetch), log capping.
-- **Hook integration**: spawn each script with stdin fixtures, a temporary `CLAUDE_CONFIG_DIR` and
-  `CLAUDE_PLUGIN_DATA`, and `JEV_BASE_URL` pointing at a local mock JEV server. Covers the success path,
-  401, 429 then success, timeout, and malformed JSON. Asserts exit code 0 and stdout JSON shape in every case.
-- **Plugin checks**: `claude plugin validate` on the plugin and the marketplace; install through
-  `claude plugin marketplace add <repo path>` + `claude plugin install jev-router@claude-token-plugins`
-  into a throwaway `CLAUDE_CONFIG_DIR`.
-- **Headless end to end**: `claude --plugin-dir plugins/jev-router -p "<prompt>"` with the mock JEV
-  server, asserting that `decisions.jsonl` gained an entry and that a >800-line Read was denied once and
-  allowed on retry. The same run confirms the PostToolUse shape (§5.8 gate).
-- **Live JEV**: only if a key is available. Otherwise it is reported as *not verified live*.
+  - catalog fixtures (enabled and disabled plugins, stale cached versions, translation folders, custom agents
+    path, project scope, malformed frontmatter),
+  - shortlist, heuristics, policy (table-driven),
+  - guard rules (positive and negative case per rule, bounded pipes), ledger,
+  - wordpiece tokenizer against known token ids,
+  - typed-question maths with a fake embedder, hybrid combination, loopback URL validation,
+  - manifest hash verification, log capping.
+- **Engine integration** (runs when READY): real model, 20-prompt golden set with expected agent/difficulty;
+  report precision at ≥ 0.55 and p50/p95 latency; the no-network test (§10.2). Skipped if the engine isn't
+  installed, and reported as skipped.
+- **Setup**: install into a temp `CLAUDE_PLUGIN_DATA`, then check hash-mismatch abort, idempotent re-run and uninstall.
+- **Hook integration**: spawn scripts with stdin fixtures and a temp config/data dir. Every path (not ready,
+  ready, engine throws, timeout) exits 0 with valid JSON or empty output.
+- **Plugin**: `claude plugin validate`; marketplace add + install from the repo path into a throwaway `CLAUDE_CONFIG_DIR`.
+- **Headless end to end**: `claude --plugin-dir plugins/jev-router -p …`. Asserts:
+  - the setup reminder appears before setup,
+  - a decision is logged after setup,
+  - a Read of a >800-line file is denied once and allowed on retry,
+  - the PostToolUse shape is confirmed.
+- **CI**: GitHub Actions on `ubuntu-latest` and `windows-latest`, running unit tests, setup + engine
+  integration, and `claude plugin validate`.
 
-## 10. Non-goals
+## 12. User-trouble hardening (rev 3, 2026-09-30)
 
-Model switching, a request proxy, an MCP "decide" tool, and savings dashboards. Cortex (persistent memory)
-is a separate plugin with its own spec.
+The implementation plan carries a 21-row user-trouble register (U1–U21), with a fix and a test or check for each row. Design-level additions:
+
+- **Readiness states**: `missing | stale | broken | lite | ready`. Each state has its own SessionStart message, shown at most once per 24 h per state.
+- **Lite mode**: when the native engine can't run (unsupported OS/arch, musl, Smart App Control/AV block, or `--lite`), routing uses the built-in rules. The guard is unaffected.
+- **Setup**:
+  - preflight (Node 18+, npm, write access, ~300 MB free) and an exclusive lock;
+  - `HF_ENDPOINT` mirrors and `--model-dir` offline import, both checksum-enforced;
+  - proxy guidance in the download error.
+- **Guard**:
+  - circuit breaker after 5 denials per session;
+  - `find` with `-delete`/`-exec` isn't treated as a listing;
+  - deny reasons tell Claude to repeat the call if the user asked for full output;
+  - `agent_type` is logged for subagent calls.
+- **Hints** are tool-neutral (`delegate to subagent "<name>"`).
+- **Engine**:
+  - the model loads from bytes (non-ASCII paths);
+  - at most 40 new agent embeddings per prompt, with the cache saved every 20.
+- **Releases**:
+  - every change to shipped plugin files bumps `plugin.json` `version`, enforced in CI, because users only receive updates when it changes;
+  - weekly scheduled CI on Linux, Windows and macOS.
+- **Latency budget**: route hook p95 ≤ 1200 ms and guard hook p95 ≤ 200 ms, measured by `scripts/bench-hooks.js`.
+- **Live-verified behaviours** (Task 3b), recorded in §3: coexistence with other plugins' hooks, hooks inside subagents, Edit after a partial Read, a missing Node, and plugin paths with spaces.
+
+## 13. Non-goals
+
+The TypeSafe hosted API, model switching, a request proxy, an MCP decide tool, and savings dashboards.
+Cortex is specified separately.

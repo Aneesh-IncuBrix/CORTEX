@@ -39,6 +39,15 @@ How jev-router proves and improves itself:
 
 Savings figures use first-party list prices and are estimates. If you route through another provider, your real prices differ.
 
-Install instructions will be added once the first plugin is published.
+## Install
+
+In Claude Code (2.1.275 or later):
+
+```
+/plugin install jev-router --marketplace Aneesh-IncuBrix/CORTEX
+/jev-router:setup
+```
+
+Context warnings, the holdout and the dashboard work immediately; prompt routing starts after `/jev-router:setup`. Then run `node <plugin>/scripts/build-labels.js` once so difficulty routing learns from your own history.
 
 License: MIT

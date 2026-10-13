@@ -15,6 +15,7 @@ const { LEVELS } = require('../lib/engine');
 
 // ponytail: fixed thresholds from one user's history; revisit if label counts are badly skewed.
 function labelOf(t) {
+  if (t.delegated) return 3;
   if (t.tools <= 2 && t.outTokens < 1500) return 1;
   if (t.tools > 20 || t.outTokens > 20000) return 3;
   return 2;
@@ -54,7 +55,7 @@ async function main() {
   const items = [];
   for (const l of [1, 2, 3]) {
     for (const p of shuffled(byLevel[l]).slice(0, maxPerLevel)) {
-      items.push({ l, v: Array.from(await embedder.embed(p), x => Math.round(x * 1e4) / 1e4) });
+      items.push({ l, v: Array.from(await embedder.embed(p), x => Math.round(x * 1e3) / 1e3) });
     }
   }
 
@@ -81,4 +82,6 @@ async function main() {
   console.log(`wrote ${items.length} labels to ${path.join(dataDir, 'labels.json')}`);
 }
 
-main().catch(e => { console.error(e.message); process.exit(1); });
+if (require.main === module) main().catch(e => { console.error(e.message); process.exit(1); });
+
+module.exports = { labelOf };

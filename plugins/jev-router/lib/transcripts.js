@@ -9,7 +9,7 @@ const PRICES = {
   'claude-fable-5-1': [10, 50, 0.25],
   'claude-opus-5-5': [4, 20, 0.2],
   'claude-sonnet-5-5': [2, 10, 0.2],
-  'claude-haiku-5-5': [0.1, 0.5, 0.01],
+  'claude-haiku-5-5': [0.1, 0.5, 0.01], // cache read not in the source table: assumed 10% of input
 };
 const DEFAULT_PRICE = PRICES['claude-opus-5-5'];
 
@@ -88,7 +88,12 @@ function readTurns(file) {
     const i = idx.get(row);
     while (s < starts.length && starts[s][0] < i) { cur = starts[s][1]; turns.push(cur); s++; }
     if (!cur || row.isSidechain) continue;
-    for (const b of m.content || []) if (b.type === 'tool_use') cur.tools++;
+    for (const b of m.content || []) {
+      if (b.type !== 'tool_use') continue;
+      cur.tools++;
+      // Subagent work lives in another file; a hand-off means the real work was not small.
+      if (/^(Agent|Task|Workflow)$/.test(b.name)) cur.delegated = true;
+    }
     if (!first) continue;
     const c = usageCost(m.model, m.usage);
     cur.cost += c;
@@ -112,4 +117,4 @@ function fileCost(file) {
   return { session, ts, byModel };
 }
 
-module.exports = { PRICES, priceOf, usageCost, listTranscripts, readLines, promptText, readTurns, fileCost };
+module.exports = { usageCost, listTranscripts, promptText, readTurns, fileCost };

@@ -48,11 +48,11 @@ test('scan finds call sites, loop + premium advice, legacy gemini via helper, ne
 });
 
 test('scan reports existing routers from env and settings', () => {
-  const dir = repo({ '.claude/settings.json': JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:20128' }, enabledPlugins: { 'omniroute@x': true, 'jev-router@y': true } }) });
+  const dir = repo({ '.claude/settings.json': JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:20128' }, enabledPlugins: { 'omniroute@x': true, 'jev-router@y': true, 'cortex@claude-token-plugins': true } }) });
   const r = scan(dir, path.join(dir, 'no-config'), { ANTHROPIC_BASE_URL: 'http://localhost:4000' });
   const names = r.routers.map(x => x.name);
   assert.ok(names.includes('ANTHROPIC_BASE_URL'));
   assert.ok(names.includes('omniroute@x'));
-  assert.ok(!names.some(n => n.startsWith('jev-router')));
+  assert.ok(!names.some(n => n.startsWith('jev-router') || n.startsWith('cortex')));
   fs.rmSync(dir, { recursive: true, force: true });
 });

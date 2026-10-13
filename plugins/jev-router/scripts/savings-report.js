@@ -80,9 +80,13 @@ function print(r) {
 }
 
 // Month-to-date spend from all sessions, projected linearly to month end.
-function budgetStatus(projectsDir, dataDir, limit, now = new Date()) {
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-  const r = report({ projectsDir, dataDir, since: start });
+function monthStart(now) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+// Pass the main report when it already covers exactly this month, so logs are read once.
+function budgetStatus(projectsDir, dataDir, limit, now = new Date(), monthReport = null) {
+  const r = monthReport || report({ projectsDir, dataDir, since: monthStart(now) });
   const spent = r.arms.routed.cost + r.arms.baseline.cost;
   const day = now.getUTCDate();
   const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
@@ -94,9 +98,11 @@ if (require.main === module) {
   const argv = process.argv.slice(2);
   const projectsDir = arg(argv, '--projects') || path.join(cfg.configDir, 'projects');
   const dataDir = arg(argv, '--data') || cfg.dataDir;
-  const r = report({ projectsDir, dataDir, since: arg(argv, '--since') });
   const limit = Number(arg(argv, '--budget'));
-  if (limit > 0) r.budget = budgetStatus(projectsDir, dataDir, limit);
+  const since = arg(argv, '--since') || (limit > 0 ? monthStart(new Date()) : null);
+  const r = report({ projectsDir, dataDir, since });
+  const sameMonth = since && monthStart(new Date()).startsWith(since.slice(0, 10)) ? r : null;
+  if (limit > 0) r.budget = budgetStatus(projectsDir, dataDir, limit, new Date(), sameMonth);
   if (argv.includes('--json')) console.log(JSON.stringify(r, null, 2));
   else print(r);
 }

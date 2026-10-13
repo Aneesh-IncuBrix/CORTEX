@@ -132,7 +132,8 @@ function detectRouters(configDir, root, env = process.env) {
     try { s = JSON.parse(safeRead(f)); } catch { continue; }
     for (const k of Object.keys(s.env || {})) if (/^ANTHROPIC_(BASE_URL|MODEL|DEFAULT_|SMALL_FAST)|SUBAGENT_MODEL/.test(k)) found.push({ kind: 'settings', name: k, file: f });
     for (const p of Object.keys(s.enabledPlugins || {})) {
-      if (/rout|proxy|omni|gateway|litellm|ccr|token|cost/i.test(p) && !p.startsWith('jev-router')) found.push({ kind: 'plugin', name: p, note: 'Another routing/token plugin is enabled; jev-router only adds hints and subagents, so both can run.' });
+      const n = p.split('@')[0]; // the marketplace part ("…@claude-token-plugins") must not match
+      if (/rout|proxy|omni|gateway|litellm|ccr|token|cost/i.test(n) && n !== 'jev-router') found.push({ kind: 'plugin', name: p, note: 'Another routing/token plugin is enabled; jev-router only adds hints and subagents, so both can run.' });
     }
   }
   if (fs.existsSync(path.join(os.homedir(), '.claude-code-router'))) found.push({ kind: 'tool', name: 'claude-code-router' });
@@ -194,4 +195,4 @@ if (require.main === module) {
   else print(r);
 }
 
-module.exports = { scan, tier, recommend, detectRouters };
+module.exports = { scan, tier };

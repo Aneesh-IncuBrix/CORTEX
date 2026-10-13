@@ -34,6 +34,33 @@ test('promptText accepts IDE text blocks and rejects tool results and tags', () 
   assert.strictEqual(promptText(u('<task-notification>')), null);
 });
 
+test('labelOf: small, big, and delegated turns', () => {
+  const { labelOf } = require('../scripts/build-labels');
+  assert.strictEqual(labelOf({ tools: 1, outTokens: 300 }), 1);
+  assert.strictEqual(labelOf({ tools: 8, outTokens: 5000 }), 2);
+  assert.strictEqual(labelOf({ tools: 30, outTokens: 5000 }), 3);
+  assert.strictEqual(labelOf({ tools: 1, outTokens: 300, delegated: true }), 3);
+});
+
+test('readTurns marks a turn that hands work to a subagent', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jr-dl-'));
+  const rows = [
+    { type: 'user', sessionId: 's', message: { content: 'review the whole repo' } },
+    { type: 'assistant', sessionId: 's', message: { id: 'm1', model: 'claude-opus-5-5', usage: { output_tokens: 50 }, content: [{ type: 'tool_use', name: 'Agent' }] } },
+  ];
+  fs.writeFileSync(path.join(dir, 's.jsonl'), rows.map(r => JSON.stringify(r)).join('\n'));
+  assert.strictEqual(readTurns(path.join(dir, 's.jsonl'))[0].delegated, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('budgetStatus reuses a given month report and projects linearly', () => {
+  const { budgetStatus } = require('../scripts/savings-report');
+  const r = { arms: { routed: { cost: 10 }, baseline: { cost: 90 } } };
+  const b = budgetStatus('unused', 'unused', 200, new Date('2026-10-10T12:00:00Z'), r);
+  assert.strictEqual(b.spent, 100);
+  assert.strictEqual(b.projected, 310);
+});
+
 function writeSession(dir, session, prompt, model) {
   const rows = [
     { type: 'user', sessionId: session, timestamp: '2026-10-10T00:00:00Z', message: { content: prompt } },
